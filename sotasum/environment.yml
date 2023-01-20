@@ -1,4 +1,4 @@
-name: sotasum-hf4
+name: ramds
 
 channels:
   - pytorch
@@ -29,3 +29,4 @@ dependencies:
       - rouge-score
       - rich
       - pymsteams
+      - tensorboard
