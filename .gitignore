@@ -1,9 +1,7 @@
 SSN
 MNIST
 Multi-XScience-master
-data_hf
 models_lf
-pretrainedmodels
 *.ckpt
 .vscode
 *.xz
@@ -16,7 +14,6 @@ original
 mlruns
 lightning_logs
 tmp
-outputs
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,visualstudiocode,jupyternotebooks,macos
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,visualstudiocode,jupyternotebooks,macos
