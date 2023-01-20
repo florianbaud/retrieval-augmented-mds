@@ -1,0 +1,31 @@
+name: sotasum-hf4
+
+channels:
+  - pytorch
+  - conda-forge
+  - nvidia
+
+dependencies:
+  - python=3.8
+  - pytorch=1.12.0=py3.8_cuda11.3_cudnn8.3.2_0
+  - torchvision=0.13.0=py38_cu113
+  - torchaudio=0.12.0=py38_cu113
+  - faiss-cpu=1.7.3=py3.8_h2a577fa_0_cpu
+  - pip
+  - notebook
+  - ipywidgets
+  - pip:
+      - pytorch-lightning
+      - mlflow
+      - deepspeed
+      - transformers<4.23.0
+      - datasets
+      - evaluate
+      - pandas
+      - gdown
+      - httpx
+      - matplotlib
+      - nltk
+      - rouge-score
+      - rich
+      - pymsteams
