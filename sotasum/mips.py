@@ -5,13 +5,11 @@ import numpy as np
 import multiprocess
 import time
 import cloudpickle
-import pyarrow as pa
-import pyarrow.compute as pc
-import pandas as pd
 import rich
 
 from random import random
-from data_loaders import load_mips_multi_x_science
+from data_loaders import load_mips_multi_x_science, load_mips_arxiv
+from pretrain import retriever_metrics
 from datasets.arrow_dataset import Dataset
 from transformers import LongformerTokenizer, LongformerConfig, LongformerModel
 from transformers.models.longformer.modeling_longformer import LongformerBaseModelOutputWithPooling
@@ -88,11 +86,15 @@ class MipsEncoder(nn.Module):
         input_ids = tokens['input_ids']
 
         # put global attention on <s> token
-        global_attention_mask = torch.zeros_like(input_ids).cuda()
+        global_attention_mask = torch.zeros_like(
+            input_ids, device=input_ids.device)
         global_attention_mask[:, 0] = 1
 
+        if not self.args.use_attention_mask:
+            tokens['attention_mask'] = None
         outputs = self.model(
             input_ids=input_ids,
+            attention_mask=tokens['attention_mask'],
             global_attention_mask=global_attention_mask
         )
         return outputs
@@ -126,6 +128,11 @@ class Mips(nn.Module):
             self.data = load_mips_multi_x_science(
                 data_path=args.data_path,
                 script_path=self.args.mips_data_script_path,
+                column="ref_abstract" if self.args.source_memory else "related_work",
+            )
+        elif args.mips_dataset == "arxiv":
+            self.data = load_mips_arxiv(
+                data_path=args.mips_arxiv_data_path,
             )
         else:
             assert False, f"{args.mips_dataset} not found."
@@ -138,7 +145,7 @@ class Mips(nn.Module):
         self.memory_tokenizer_kwargs = {
             "max_length": self.args.memory_tok_max_length,
         }
-        self.memory_tokenizer = LongformerTokenizer.from_pretrained(
+        self.memory_tokenizer: LongformerTokenizer = LongformerTokenizer.from_pretrained(
             pretrained_model_name_or_path=self.args.memory_model_name,
         )
         memory_config = LongformerConfig.from_pretrained(
@@ -151,6 +158,9 @@ class Mips(nn.Module):
             # add_pooling_layer=False,
         )
 
+        self.eos_id = self.memory_tokenizer.eos_token_id
+        self.bos_id = self.memory_tokenizer.bos_token_id
+
         self.string_factory = self.args.mips_string_factory
         self.train_size = self.args.mips_train_size
         self.metric_type = self.args.mips_metric_type
@@ -159,7 +169,7 @@ class Mips(nn.Module):
         self.max_norm = None
         self.has_context = False
         self.rebuilt_steps = [0]
-        self.load_from_cache_file = True
+        self.load_from_cache_file = False
         self.text_column = "mips_column"
         self.index_column = "aid"
         self.index_name = "mips_embeddings"
@@ -168,29 +178,34 @@ class Mips(nn.Module):
         self.examples = None
 
     def encode_text(self, num_proc: int = 1, batch_size: int = 32) -> None:
-        self.new_fingerprint = f"{self.args.mips_cache_prefix}-{self.rebuilt_steps[-1]}-{self.args.mips_db_max_size}"
+        # self.new_fingerprint = f"{self.args.mips_cache_prefix}-{self.rebuilt_steps[-1]}-{self.args.mips_db_max_size}"
         desc = "Encoding"
+        device = 0
+        if not torch.cuda.is_available():
+            device = "cpu"
+            num_proc = 1
+            print("Cuda is not available, encoding memory on single cpu...")
         self.eval()
         if num_proc > 1:
             self._init_context()
-            self.embeddings = self.data.map(
+            self.embeddings: Dataset = self.data.map(
                 self._map_encode,
                 batched=True,
                 batch_size=batch_size,
                 num_proc=num_proc,
                 with_rank=True,
-                new_fingerprint=self.new_fingerprint,
+                # new_fingerprint=self.new_fingerprint,
                 load_from_cache_file=self.load_from_cache_file,
                 desc=desc,
             )
         elif num_proc == 1:
-            fn_kwargs = {"rank": 0}
-            self.embeddings = self.data.map(
+            fn_kwargs = {"rank": device}
+            self.embeddings: Dataset = self.data.map(
                 self._map_encode,
                 batched=True,
                 batch_size=batch_size,
                 fn_kwargs=fn_kwargs,
-                new_fingerprint=self.new_fingerprint,
+                # new_fingerprint=self.new_fingerprint,
                 load_from_cache_file=self.load_from_cache_file,
                 desc=desc,
             )
@@ -202,33 +217,40 @@ class Mips(nn.Module):
         self.train()
 
     def build_index(self) -> None:
-        max_norm_fingerprint = self.new_fingerprint + "-max_norm"
+        # max_norm_fingerprint = self.new_fingerprint + "-max_norm"
         self.max_norm = self.embeddings.map(
             self._map_norm,
             batched=True,
             desc="Calculating max norm",
             load_from_cache_file=self.load_from_cache_file,
-            new_fingerprint=max_norm_fingerprint,
+            # new_fingerprint=max_norm_fingerprint,
         )['norm'].max()
 
         if self.normalize and self.metric_type == faiss.METRIC_INNER_PRODUCT:
-            self.new_fingerprint += "-normalized"
+            # self.new_fingerprint += "-normalized"
             self.embeddings = self.embeddings.map(
                 self._map_normalize,
                 batched=True,
                 desc="Normalization",
                 load_from_cache_file=self.load_from_cache_file,
-                new_fingerprint=self.new_fingerprint,
+                # new_fingerprint=self.new_fingerprint,
             )
 
         if self.metric_type == faiss.METRIC_L2:
-            self.new_fingerprint += "-augmented"
+            # self.new_fingerprint += "-augmented"
+            self.phi = self.embeddings.map(
+                lambda x: {"phi": (x[self.embeddings_column]**2).sum(1)},
+                batched=True,
+                desc="Calculating phi...",
+                load_from_cache_file=self.load_from_cache_file,
+            )
+            self.phi = self.phi['phi'].max()
             self.embeddings = self.embeddings.map(
                 self._map_augment_xb,
                 batched=True,
                 desc="Augmenting data",
                 load_from_cache_file=self.load_from_cache_file,
-                new_fingerprint=self.new_fingerprint,
+                # new_fingerprint=self.new_fingerprint,
             )
 
         self.embeddings.add_faiss_index(
@@ -239,6 +261,10 @@ class Mips(nn.Module):
             metric_type=self.metric_type,
         )
 
+        if isinstance(self.args.mips_nprobe, int):
+            self.embeddings.get_index(
+                self.index_name).faiss_index.nprobe = self.args.mips_nprobe
+
     def _map_norm(self, x: dict) -> dict:
         norm = np.linalg.norm(x[self.embeddings_column], axis=1, keepdims=True)
         return {"norm": norm}
@@ -248,18 +274,13 @@ class Mips(nn.Module):
         tokens = self.encoder.tokenize(x[self.text_column])
         output = self.encoder.encode(tokens)
         output = output.last_hidden_state[:, 0, :].cpu().numpy()
-        x[self.embeddings_column] = output.astype(np.float32)
-        return x
+        return {self.embeddings_column: output.astype(np.float32)}
 
     def _map_normalize(self, x: dict) -> dict:
-        x[self.embeddings_column] = self.l2_normalization(
-            x[self.embeddings_column])
-        return x
+        return {self.embeddings_column: self.l2_normalization(x[self.embeddings_column])}
 
     def _map_augment_xb(self, x: dict) -> dict:
-        x[self.embeddings_column] = augment_xb(
-            x[self.embeddings_column], phi=self.max_norm**2)
-        return x
+        return {self.embeddings_column: augment_xb(x[self.embeddings_column], phi=self.phi)}
 
     def _prepare_query(self, query: np.ndarray) -> np.ndarray:
         if self.normalize and self.metric_type == faiss.METRIC_INNER_PRODUCT:
@@ -278,20 +299,9 @@ class Mips(nn.Module):
     def search(self, queries: np.ndarray, ignore_indexes: list = None, k: int = 10):
         queries = self._prepare_query(query=queries)
 
-        # sel = None
-        # if ignore_indexes is not None:
-        #     sel = pc.index_in(
-        #         self.data.data.table['aid'],
-        #         pa.array(ignore_indexes),
-        #     ).drop_null().to_pylist()
-        #     sel = faiss.IDSelectorNot(faiss.IDSelectorBatch(sel))
-
         scores, indices = self.embeddings.get_index(self.index_name).faiss_index.search(
             queries,
             k + 1 if ignore_indexes is not None else k,
-            # params=faiss.SearchParameters(
-            #     sel=sel,
-            # ),
         )
 
         if ignore_indexes is not None:
@@ -303,14 +313,17 @@ class Mips(nn.Module):
         return scores, indices
 
     def forward(
-            self,
-            queries: np.ndarray,
-            target_str: list = None,
-            ignore_indexes: list = None,
-            k: int = 10
+        self,
+        queries: np.ndarray,
+        aid: list = None,
+        aid_counts: torch.Tensor = None,
+        target_str: list = None,
+        input_str: list = None,
+        ignore_indexes: list = None,
+        k: int = 10
     ):
 
-        if self.args.memory_forcing == "target_only":
+        if self.args.memory_forcing == "target_only" and self.args.multi_x_science_dataset_mode == "original":
             flat_texts = target_str
             k = 1
             scores = None
@@ -324,37 +337,32 @@ class Mips(nn.Module):
             self.examples = [self.embeddings[i][self.text_column]
                              for i in indices]
 
-            if self.args.memory_forcing == "target_in":
-                if self.args.copy_forcing > random() and isinstance(target_str, list):
-                    flat_texts = [t for i, df in enumerate(
-                        self.examples) for t in ([target_str[i]] + df)]
-                    k += 1
-                else:
-                    flat_texts = [t for df in self.examples for t in df]
-            elif self.args.memory_forcing == "no_forcing":
+            if self.args.memory_forcing == "target_in" and self.args.multi_x_science_dataset_mode == "original" and self.args.copy_forcing > random() and isinstance(target_str, list):
+                flat_texts = [t for i, df in enumerate(
+                    self.examples) for t in ([target_str[i]] + df)]
+                k += 1
+            elif self.args.memory_forcing in ["no_forcing", "retrieved_forcing"] and self.args.multi_x_science_dataset_mode == "original":
                 flat_texts = [t for df in self.examples for t in df]
+            elif self.args.multi_x_science_dataset_mode == "dual" and input_str != None:
+                input_list = (i.split(self.args.doc_sep)
+                              [:k] for i in input_str)
+                flat_texts = [j for e, i in zip(
+                    self.examples, input_list) for j in i + e[:(k - len(i))]]
+            else:
+                flat_texts = [t for df in self.examples for t in df]
+                # assert False, "Candidates are missing, please verify memory_forcing or dataset_mode."
+
+        metrics = None
+        if aid is not None and self.args.log_retriever_metrics:
+            examples = [self.embeddings[i] for i in indices]
+
+            pred = torch.tensor([[b == a for a in e['aid']]
+                                for e, b in zip(examples, aid)]).float()
+            metrics = retriever_metrics(pred, aid_counts.cpu())
 
         tokens = self.encoder.tokenize(flat_texts)
         # TODO: Implement DataLoader ?
         mips_outputs = self.encoder(tokens)
-
-        memory_tokens = self.memory_tokenizer(
-            flat_texts,
-            padding="max_length",
-            return_tensors='pt',
-            truncation=True,
-            **self.memory_tokenizer_kwargs,
-        ).to(self.memory_encoder.device)
-        memory_input_ids = memory_tokens['input_ids']
-
-        # put global attention on <s> token
-        global_attention_mask = torch.zeros_like(memory_input_ids).cuda()
-        global_attention_mask[:, 0] = 1
-
-        memory_outputs = self.memory_encoder(
-            input_ids=memory_input_ids,
-            global_attention_mask=global_attention_mask
-        )
 
         mips_last_hidden_state: torch.Tensor = mips_outputs[0]
         mips_sequence_len = mips_last_hidden_state.shape[1]
@@ -365,7 +373,33 @@ class Mips(nn.Module):
             -1,
         )
 
-        return scores, mips_last_hidden_state, memory_outputs, memory_tokens
+        memory_tokens = self.memory_tokenizer(
+            flat_texts,
+            padding="max_length",
+            return_tensors='pt',
+            truncation=True,
+            **self.memory_tokenizer_kwargs,
+        ).to(self.memory_encoder.device)
+
+        # put global attention on <s> token
+        global_attention_mask = torch.zeros_like(
+            memory_tokens['input_ids'], device=memory_tokens['input_ids'].device)
+        global_attention_mask[:, 0] = 1
+
+        if not self.args.use_attention_mask:
+            memory_tokens['attention_mask'] = None
+        memory_outputs = self.memory_encoder(
+            input_ids=memory_tokens['input_ids'],
+            attention_mask=memory_tokens['attention_mask'],
+            global_attention_mask=global_attention_mask
+        )
+
+        memory_input_ids = memory_tokens['input_ids'].clone()
+        memory_attention_mask = memory_tokens['attention_mask'].masked_fill(
+            (memory_input_ids == self.eos_id) | (memory_input_ids == self.bos_id), 0).clone()
+        # .clone()
+
+        return scores, metrics, mips_last_hidden_state, memory_outputs, memory_input_ids, memory_attention_mask
 
     def l2_normalization(self, x: np.ndarray) -> np.ndarray:
         if not x.flags.c_contiguous:
@@ -549,7 +583,7 @@ if __name__ == "__main__":
     #                    model_name=model_name, data=multixsci)
 
     args = get_args()
-    rich.print(args)
+    rich.print(str(args).replace(", ", ",\n"))
 
     pl_model = LongformerLightning(
         args=args,

@@ -1,4 +1,4 @@
-name: sotasum-hf4
+name: sotasum
 
 channels:
   - pytorch
@@ -6,18 +6,21 @@ channels:
   - nvidia
 
 dependencies:
-  - python=3.8
-  - pytorch=1.12.0=py3.8_cuda11.3_cudnn8.3.2_0
-  - torchvision=0.13.0=py38_cu113
-  - torchaudio=0.12.0=py38_cu113
-  - faiss-cpu=1.7.3=py3.8_h2a577fa_0_cpu
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.7
+  - faiss-cpu
   - pip
   - notebook
   - ipywidgets
   - pip:
-      - pytorch-lightning
+      - pytorch-lightning[extra]
       - mlflow
+      - tensorboard
       - deepspeed
+      - fairscale
       - transformers<4.23.0
       - datasets
       - evaluate

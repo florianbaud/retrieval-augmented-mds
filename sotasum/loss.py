@@ -72,3 +72,31 @@ def label_smoothed_nll_loss_custom(
         smooth_loss = smooth_loss.sum() / count
     loss = (1.0 - epsilon - eps_i) * nll_loss + smooth_loss
     return loss, nll_loss
+
+
+def label_smoothed_nll_loss_transformers(
+    log_probs: torch.Tensor,
+    labels: torch.Tensor,
+    epsilon: float,
+    ignore_index: int,
+):
+    if labels.dim() == log_probs.dim() - 1:
+        labels = labels.unsqueeze(-1)
+
+    padding_mask = labels.eq(ignore_index)
+    # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
+    # will ignore them in any case.
+    labels = torch.clamp(labels, min=0)
+    nll_loss = log_probs.gather(dim=-1, index=labels)
+    # works for fp16 input tensor too, by internally upcasting it to fp32
+    smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
+
+    nll_loss.masked_fill_(padding_mask, 0.0)
+    smoothed_loss.masked_fill_(padding_mask, 0.0)
+
+    # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
+    num_active_elements = padding_mask.numel() - padding_mask.long().sum()
+    nll_loss = nll_loss.sum() / num_active_elements
+    smoothed_loss = smoothed_loss.sum() / (num_active_elements *
+                                           log_probs.shape[-1])
+    return (1 - epsilon) * nll_loss + epsilon * smoothed_loss

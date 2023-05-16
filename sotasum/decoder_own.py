@@ -36,6 +36,7 @@ class LEDDecoderAttention(nn.Module):
         self.is_decoder = is_decoder
 
         self.beta = nn.Parameter(torch.ones(1))
+        self.beta_bias = nn.Parameter(torch.zeros(1))
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -104,8 +105,8 @@ class LEDDecoderAttention(nn.Module):
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         ##### Bias attention weights #####
-        attn_weights += (self.beta *
-                         attention_bias.view(attention_bias.shape[0], 1, -1))
+        attn_weights += (self.beta * attention_bias.view(
+            attention_bias.shape[0], 1, -1) + self.beta_bias)
         ##################################
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
@@ -435,8 +436,8 @@ class DecoderForCopyGeneration(nn.Module):
         self.decoder = CopyDecoder(config)
         self.alignment_layer_norm = nn.LayerNorm(embed_dim)
         self.diverter = nn.Linear(diverter_dim, 2)
-        self.output_projection = nn.Linear(
-            embed_dim, config.num_embeddings, bias=False)
+        # self.output_projection = nn.Linear(
+        #     embed_dim, config.num_embeddings, bias=False)
 
         self.output_attention = True
         self.return_dict = True
@@ -453,7 +454,7 @@ class DecoderForCopyGeneration(nn.Module):
         encoder_attention_mask: torch.Tensor = None,  # Memory attention_mask
     ):
 
-        # # seq_len x (batch_size * mips_topk)
+        # # batch_size x (seq_len * mips_topk)
         # print("Copy sequence shape :", copy_sequence.shape)
         # # batch_size x (tgt_len - 1) x hidden_size
         # print("Decoder hidden_states shape :", decoder_hidden_states.shape)
@@ -463,7 +464,7 @@ class DecoderForCopyGeneration(nn.Module):
         # print("Decoder attention_mask shape :", decoder_attention_mask.shape)
         # # batch_size x (seq_len * mips_topk) x hidden_size
         # print("Memory hidden_states shape :", encoder_hidden_states.shape)
-        # # (seq_len * mips_topk) x batch_size
+        # # batch_size x (seq_len * mips_topk)
         # print("Memory attention_mask shape :", encoder_attention_mask.shape)
 
         copy_decoder_outputs = self.decoder(
@@ -490,12 +491,12 @@ class DecoderForCopyGeneration(nn.Module):
         # print("Raw attention shape :", attn.shape)
         # # batch_size x (seq_len - 1) x hidden_size
         # print("Copy decoder outputs shape :", outs.shape)
-        # # batch_size x 1 x (seq_len - 1) x hidden_size
+        # # batch_size x 1 x (seq_len - 1) x memory_len
         # print("Attention weights shape :", alignment_weight.shape)
         # # batch_size x (seq_len - 1) x hidden_size
         # print("Decoder hidden states shape :", decoder_hidden_states.shape)
 
-        alignment_weight = alignment_weight.squeeze()
+        alignment_weight = alignment_weight.squeeze(1)
 
         if self.gates_attn == "nmt":
             attn_normalized = self.alignment_layer_norm(attn)
@@ -506,21 +507,11 @@ class DecoderForCopyGeneration(nn.Module):
             gates_input = torch.cat([outs, decoder_hidden_states], -1)
 
         gates = F.softmax(self.diverter(gates_input), -1)
-
         gen_gate, copy_gate = gates.chunk(2, dim=-1)
 
-        bsz, seq_len, _ = outs.size()
-        probs = gen_gate * F.softmax(self.output_projection(outs), -1)
-
-        index = copy_sequence.reshape((bsz, 1, -1)).expand(-1, seq_len, -1)
         copy_probs = (copy_gate * alignment_weight)
-        probs_both = probs.scatter_add_(-1, index, copy_probs)
-        copy_probs = torch.zeros_like(
-            probs).scatter_add_(-1, index, copy_probs)
 
-        lprobs = torch.log(probs_both + 1e-7)
-
-        return lprobs, copy_probs
+        return gen_gate, copy_gate, copy_probs
 
     def _init_weights(self, module):
         std = self.config.init_std

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 import time
 import os
@@ -7,6 +8,7 @@ import shutil
 import argparse
 import rich
 
+from model_config import ModelConfig
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from transformers.file_utils import ModelOutput
@@ -27,11 +29,14 @@ class RGEncoderModelOutput(ModelOutput):
     memory_mask: torch.FloatTensor = None
     memory_bias: torch.FloatTensor = None
     copy_sequence: torch.FloatTensor = None
+    mips_scores: torch.FloatTensor = None
 
 
 @dataclass
 class RGDecoderModelOutput(ModelOutput):
     logits: torch.FloatTensor
+    copy_probs: torch.FloatTensor = None
+    copy_gate: torch.FloatTensor = None
     past_key_values: Tuple[torch.FloatTensor] = None
 
 
@@ -42,7 +47,7 @@ def dist_barrier(args: argparse.Namespace) -> None:
 
 class SotasumEncoder(nn.Module):
 
-    def __init__(self, args, encoder, doc_sep_id: int) -> None:
+    def __init__(self, args: ModelConfig, encoder, doc_sep_id: int) -> None:
         super().__init__()
 
         self.args = args
@@ -90,20 +95,25 @@ class SotasumEncoder(nn.Module):
         query_input_ids: torch.Tensor = None,
         query_attention_mask: torch.Tensor = None,
         mips_ignore_indexes: list = None,
+        aid: list = None,
+        aid_counts: torch.Tensor = None,
         target_str: list = None,
+        input_str: list = None,
         return_dict: bool = True,
         **kwargs
     ):
 
-        memory, memory_bias, memory_mask, copy_seq = None, None, None, None
+        memory, memory_bias, memory_mask, copy_seq, mips_scores = None, None, None, None, None
         if not self.args.mips_disabled:
             query_batch_size = query_input_ids.shape[0]
 
             # put global attention on <s> token
             query_global_attention_mask = torch.zeros_like(
-                query_input_ids).cuda()
+                query_input_ids, device=query_input_ids.device)
             query_global_attention_mask[:, 0] = 1
 
+            if not self.args.use_attention_mask:
+                query_attention_mask = None
             query_encoder_outputs = self.query_encoder(
                 input_ids=query_input_ids,
                 attention_mask=query_attention_mask,
@@ -115,19 +125,20 @@ class SotasumEncoder(nn.Module):
             # query = _layer_norm(query)
             query: torch.Tensor = query[:, :1, :]
 
-            mips_query = query\
-                .squeeze(1)\
-                .detach()\
-                .cpu()\
-                .numpy()\
-                .astype("float32")
+            mips_query = query[:, 0, :].detach().cpu().float().numpy()
 
-            _, mips_last_hidden_state, memory_outputs, memory_tokens = self.mips(
+            _, metrics, mips_last_hidden_state, memory_outputs, memory_input_ids, memory_attention_mask = self.mips(
                 queries=mips_query,
+                aid=aid,
+                aid_counts=aid_counts,
                 target_str=target_str,
+                input_str=input_str,
                 k=self.args.mips_topk,
                 ignore_indexes=mips_ignore_indexes,
             )
+
+            if metrics is not None:
+                kwargs.get("logger")(metrics, sync_dist=True)
 
             mips_cls: torch.Tensor = mips_last_hidden_state[:, :, 0, :]
             mips_scores = (query @ mips_cls.transpose(1, 2)).squeeze(1)
@@ -149,8 +160,6 @@ class SotasumEncoder(nn.Module):
             ### => https://github.com/jcyk/copyisallyouneed ###
             # mips_scores /= self.mips.max_norm**2
 
-            # print('MIPS np scores :', mips_np_scores)
-            # print('MIPS Raw scores :', mips_raw_scores)
             # print('MIPS Recomputed scores :', mips_scores)
 
             memory_last_hidden_state: torch.Tensor = memory_outputs[0]
@@ -159,22 +168,25 @@ class SotasumEncoder(nn.Module):
 
             memory = memory_last_hidden_state.reshape(
                 query_batch_size, memory_seq_len*topk, -1)
-            memory_mask = memory_tokens['attention_mask']\
-                .view(query_batch_size, -1).bool()
+            memory_mask: torch.Tensor = memory_attention_mask.view(
+                query_batch_size, -1)
             memory_bias = mips_scores\
                 .unsqueeze(-1)\
                 .expand(-1, -1, memory_seq_len)\
                 .reshape(query_batch_size, -1)
-            copy_seq = memory_tokens['input_ids'].view(query_batch_size, -1)
+            copy_seq = memory_input_ids.view(query_batch_size, -1)
 
         # put global attention on <s> token
-        global_attention_mask = torch.zeros_like(input_ids).cuda()
+        global_attention_mask = torch.zeros_like(
+            input_ids, device=input_ids.device)
         global_attention_mask[:, 0] = 1
 
         # Put global attetion on <doc> token
         doc_token = input_ids == self.doc_sep_id
         global_attention_mask[doc_token] = 1
 
+        if not self.args.use_attention_mask:
+            attention_mask = None
         encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -192,6 +204,7 @@ class SotasumEncoder(nn.Module):
                 memory_mask=memory_mask,
                 memory_bias=memory_bias,
                 copy_sequence=copy_seq,
+                mips_scores=mips_scores,
             )
         return encoder_outputs + (memory, memory_mask, memory_bias, copy_seq)
 
@@ -214,10 +227,8 @@ class SotasumEncoder(nn.Module):
             )
             self.mips.load_index(self.index_file)
         elif rank > 0:
-            while not os.path.exists(self.embeddings_folder):
+            while not os.path.exists(self.max_norm_file):
                 time.sleep(0.5)
-                continue
-        dist_barrier(self.args)
         if rank > 0:
             self.mips.load(
                 self.index_file,
@@ -235,14 +246,14 @@ class SotasumEncoder(nn.Module):
 
 class RetrieverGenerator(nn.Module, GenerationMixin):
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: ModelConfig) -> None:
         super().__init__()
         self.args = args
 
         model_name = args.model_name.split('/')[-1]
         cache_dir = os.path.join(args.model_cache_dir, model_name)
 
-        self.tokenizer = LEDTokenizer.from_pretrained(
+        self.tokenizer: LEDTokenizer = LEDTokenizer.from_pretrained(
             args.model_name,
             cache_dir=cache_dir,
         )
@@ -266,18 +277,16 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
             cache_dir=cache_dir,
             config=self.config,
         )
+        # Model embeddings matrix update.
+        self.model.resize_token_embeddings(len(self.tokenizer))
 
         self.main_input_name = self.model.main_input_name
-        shared = self.model.led.shared
 
         self.encoder = SotasumEncoder(
             args=args,
             encoder=self.model.get_encoder(),
             doc_sep_id=self.docsep_token_id,
         )
-
-        # Model embeddings matrix update.
-        self.model.resize_token_embeddings(len(self.tokenizer))
 
         if not self.args.mips_disabled:
             if self.args.use_own_decoder:
@@ -293,17 +302,18 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
                     args=self.args,
                     config=copy_config,
                 )
-                self.copy_probs = None
             else:
                 embed_dim = 1024
                 self.decoder_head = CopyTokenDecoder(
                     vocabs=None,
-                    tgt_embed=shared,
+                    tgt_embed=self.model.led.shared,
                     label_smoothing=None,
                     embed_dim=embed_dim,
                     ff_embed_dim=2048,
                     dropout=0.1,
                 )
+
+        self.copy_probs = None
 
     def get_encoder(self):
         return self.encoder
@@ -315,32 +325,36 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
         self,
         input_ids: torch.FloatTensor,
         encoder_outputs: RGEncoderModelOutput,
-        ###########HACK###########
+        ########### HACK ###########
         query_input_ids=None,
         query_attention_mask=None,
-        ##########################
+        input_str=None,
+        ############################
         **kwargs,
     ):
 
         use_cache = kwargs.get("use_cache", None)
         past_key_values = kwargs.get("past", None)
 
-        expand_size = self.args.num_beams
-        batch_size = input_ids.shape[0] // expand_size
+        if self.args.num_beams > 1 and not self.args.mips_disabled:
+            expand_size = self.args.num_beams
+            batch_size = input_ids.shape[0] // expand_size
 
-        index = torch.arange(batch_size).view(-1, 1)\
-            .repeat(1, expand_size).view(-1).to(self.model.device)
+            index = torch.arange(batch_size).view(-1, 1)\
+                .repeat(1, expand_size).view(-1).to(self.model.device)
 
-        encoder_outputs.memory = encoder_outputs.memory.index_select(0, index)
-        encoder_outputs.memory_bias = encoder_outputs.memory_bias.index_select(
-            0, index)
-        encoder_outputs.memory_mask = encoder_outputs.memory_mask.index_select(
-            0, index)
-        encoder_outputs.copy_sequence = encoder_outputs.copy_sequence.index_select(
-            0, index)
+            encoder_outputs.memory = encoder_outputs.memory.index_select(
+                0, index)
+            encoder_outputs.memory_bias = encoder_outputs.memory_bias.index_select(
+                0, index)
+            encoder_outputs.memory_mask = encoder_outputs.memory_mask.index_select(
+                0, index)
+            encoder_outputs.copy_sequence = encoder_outputs.copy_sequence.index_select(
+                0, index)
 
         model_input = {
             "input_ids": input_ids,
+            "encoder_attention_mask": kwargs.get("attention_mask", None),
             "encoder_outputs": encoder_outputs,
             "use_cache": use_cache,
             "past_key_values": past_key_values,
@@ -355,6 +369,7 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor = None,
         encoder_outputs: RGEncoderModelOutput = None,
+        encoder_attention_mask: torch.Tensor = None,
         return_dict: bool = True,
         use_cache: tuple = None,
         past_key_values: torch.Tensor = None,
@@ -372,7 +387,7 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
 
         decoder_outputs = self.model(
             input_ids=None,
-            attention_mask=None,
+            attention_mask=encoder_attention_mask,
             encoder_outputs=encoder_outputs,
             decoder_input_ids=input_ids,
             decoder_attention_mask=None,
@@ -382,11 +397,12 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
             return_dict=return_dict,
         )
 
+        copy_probs, copy_gate = None, None
         if not self.args.mips_disabled:
 
             decoder_hidden_states = decoder_outputs.decoder_hidden_states[-1]
             if self.args.use_own_decoder:
-                outs = self.copy_decoder(
+                gen_gate, copy_gate, copy_probs = self.copy_decoder(
                     copy_sequence=encoder_copy_sequence,
                     decoder_hidden_states=decoder_hidden_states,  # Decoder hidden_states
                     attention_bias=encoder_memory_bias,  # Matching score
@@ -394,9 +410,21 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
                     encoder_hidden_states=encoder_memory,  # Memory hidden_states
                     encoder_attention_mask=encoder_memory_mask,
                 )
+
+                probs: torch.Tensor = gen_gate * \
+                    F.softmax(decoder_outputs.logits, -1)
+
+                bsz, seq_len, _ = decoder_hidden_states.size()
+                index = encoder_copy_sequence.reshape(
+                    (bsz, 1, -1)).expand(-1, seq_len, -1)
+                probs_both = probs.scatter_add_(-1, index, copy_probs)
+
                 if self.args.output_copy_probs:
-                    self.copy_probs += (outs[1],)
-                outs = outs[0]
+                    copy_probs_sentence = torch.zeros_like(
+                        probs).scatter_add_(-1, index, copy_probs)
+                    self.copy_probs += (copy_probs_sentence,)
+
+                outs = torch.log(probs_both + 1e-7)
             else:
                 decoder_hidden_states = decoder_hidden_states.transpose(0, 1)
                 encoder_memory = encoder_memory.reshape(
@@ -418,6 +446,8 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
         if return_dict:
             return RGDecoderModelOutput(
                 logits=outs,
+                copy_gate=copy_gate,
+                copy_probs=copy_probs,
                 past_key_values=decoder_outputs.past_key_values,
             )
 
