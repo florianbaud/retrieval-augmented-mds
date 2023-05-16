@@ -32,3 +32,4 @@ dependencies:
       - rouge-score
       - rich
       - pymsteams
+      - tensorboard
