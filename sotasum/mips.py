@@ -126,7 +126,7 @@ class Mips(nn.Module):
 
         if args.mips_dataset == "multi_x_science":
             self.data = load_mips_multi_x_science(
-                data_path=args.data_path,
+                data_path=None,
                 script_path=self.args.mips_data_script_path,
                 column="ref_abstract" if self.args.source_memory else "related_work",
             )

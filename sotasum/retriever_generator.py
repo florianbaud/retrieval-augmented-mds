@@ -1,19 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import time
 import os
-import shutil
-import argparse
 import rich
 
 from model_config import ModelConfig
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from transformers.file_utils import ModelOutput
-from transformers.generation_utils import GenerationMixin
 from transformers import LEDTokenizer, LEDForConditionalGeneration, LEDConfig, LongformerModel, LongformerConfig, LongformerTokenizer
+from transformers.modeling_utils import PreTrainedModel, PretrainedConfig
 from decoder import CopyTokenDecoder
 from mips import Mips
 from decoder_own import DecoderForCopyGeneration
@@ -40,14 +37,14 @@ class RGDecoderModelOutput(ModelOutput):
     past_key_values: Tuple[torch.FloatTensor] = None
 
 
-def dist_barrier(args: argparse.Namespace) -> None:
-    if int(args.devices) > 1:
-        dist.barrier()
-
-
 class SotasumEncoder(nn.Module):
 
-    def __init__(self, args: ModelConfig, encoder, doc_sep_id: int) -> None:
+    def __init__(
+        self,
+        args: ModelConfig = ModelConfig(),
+        encoder=None,
+        doc_sep_id: int = None,
+    ) -> None:
         super().__init__()
 
         self.args = args
@@ -211,10 +208,6 @@ class SotasumEncoder(nn.Module):
     def _build_mips_index(self, rank: int) -> None:
         torch.cuda.empty_cache()
         if rank == 0:
-            shutil.rmtree(self.args.mips_tmp_folder, ignore_errors=True)
-            os.makedirs(self.args.mips_tmp_folder, exist_ok=True)
-        dist_barrier(self.args)
-        if rank == 0:
             self.mips.encode_text(
                 num_proc=self.args.mips_num_gpus,
                 batch_size=self.args.mips_batch_size,
@@ -244,18 +237,14 @@ class SotasumEncoder(nn.Module):
             self._build_mips_index(local_rank)
 
 
-class RetrieverGenerator(nn.Module, GenerationMixin):
+class RetrieverGenerator(PreTrainedModel):
 
-    def __init__(self, args: ModelConfig) -> None:
-        super().__init__()
+    def __init__(self, args: ModelConfig = ModelConfig()) -> None:
+        super().__init__(config=PretrainedConfig())
         self.args = args
-
-        model_name = args.model_name.split('/')[-1]
-        cache_dir = os.path.join(args.model_cache_dir, model_name)
 
         self.tokenizer: LEDTokenizer = LEDTokenizer.from_pretrained(
             args.model_name,
-            cache_dir=cache_dir,
         )
         _ = self.tokenizer.add_special_tokens(
             {"additional_special_tokens": [self.args.doc_sep]})
@@ -267,16 +256,15 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
 
         self.config = LEDConfig.from_pretrained(
             pretrained_model_name_or_path=args.model_name,
-            cache_dir=cache_dir,
             use_cache=False,
             gradient_checkpointing=self.args.gradient_checkpointing,
         )
 
         self.model = LEDForConditionalGeneration.from_pretrained(
             args.model_name,
-            cache_dir=cache_dir,
             config=self.config,
         )
+
         # Model embeddings matrix update.
         self.model.resize_token_embeddings(len(self.tokenizer))
 
@@ -336,8 +324,8 @@ class RetrieverGenerator(nn.Module, GenerationMixin):
         use_cache = kwargs.get("use_cache", None)
         past_key_values = kwargs.get("past", None)
 
-        if self.args.num_beams > 1 and not self.args.mips_disabled:
-            expand_size = self.args.num_beams
+        if self.generation_config.num_beams > 1 and not self.args.mips_disabled:
+            expand_size = self.generation_config.num_beams
             batch_size = input_ids.shape[0] // expand_size
 
             index = torch.arange(batch_size).view(-1, 1)\

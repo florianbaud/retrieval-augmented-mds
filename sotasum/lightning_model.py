@@ -1,8 +1,11 @@
 import numpy as np
 import json
 import pytorch_lightning as pl
+import torch.nn.functional as F
 import torch
 import pymsteams
+import os
+import shutil
 import rich
 
 from model_config import ModelConfig
@@ -10,12 +13,10 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.strategies import DeepSpeedStrategy
 from retriever_generator import RetrieverGenerator
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, GenerationConfig
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from evaluate import load
 from loss import label_smoothed_nll_loss_transformers
-from data_loaders import MultiXScienceDataset, MultiXScienceDualDataset, MultiXScienceAggregatedDataset
-from torch.utils.data import DataLoader
 
 
 def fault_tolerant(func):
@@ -43,25 +44,9 @@ class TeamsCallback(Callback):
 
     @fault_tolerant
     @rank_zero_only
-    def on_fit_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def evaluation_msg(self, stage: str, pl_module):
         msg = pymsteams.connectorcard(hookurl=self.hookurl)
-        msg.title("🚀 Training started")
-        msg.text("Fit loop begins.")
-        msg.send()
-
-    @fault_tolerant
-    @rank_zero_only
-    def on_exception(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", exception: BaseException) -> None:
-        msg = pymsteams.connectorcard(hookurl=self.hookurl)
-        msg.title("❌ Training exception")
-        msg.text(f'An error occured : \n{exception}')
-        msg.send()
-
-    @fault_tolerant
-    @rank_zero_only
-    def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        msg = pymsteams.connectorcard(hookurl=self.hookurl)
-        msg.title("✔️ Validation End")
+        msg.title(f"✔️ {str(pl_module.__class__.__name__)} {stage} End")
 
         rouge_scores = pl_module.scores[-1]
         if isinstance(rouge_scores, dict):
@@ -71,15 +56,43 @@ class TeamsCallback(Callback):
                 section.addFact(k, v)
             msg.addSection(section)
 
-        msg.text('Check out validation summary :')
+        msg.text(f'Check out {stage} summary :')
         msg.send()
+
+    @fault_tolerant
+    @rank_zero_only
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        msg = pymsteams.connectorcard(hookurl=self.hookurl)
+        msg.title(f"🚀 {str(pl_module.__class__.__name__)} training started")
+        msg.text("Fit loop begins.")
+        msg.send()
+
+    @fault_tolerant
+    @rank_zero_only
+    def on_exception(self, trainer: pl.Trainer, pl_module: pl.LightningModule, exception: BaseException) -> None:
+        msg = pymsteams.connectorcard(hookurl=self.hookurl)
+        msg.title("❌ Training exception")
+        msg.text(f'An error occured : \n{exception}')
+        msg.send()
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self.evaluation_msg("validation", pl_module)
+
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self.evaluation_msg("test", pl_module)
 
 
 class LongformerLightning(pl.LightningModule):
 
-    def __init__(self, model_config: ModelConfig) -> None:
+    def __init__(
+        self,
+        model_config: ModelConfig = ModelConfig(),
+        generation_config: GenerationConfig = GenerationConfig(),
+    ) -> None:
         super().__init__()
         self.args = model_config
+        self.generation_config = generation_config
+
         self.losses = []
         self.scores = []
         self.validation_step_outputs = []
@@ -90,20 +103,6 @@ class LongformerLightning(pl.LightningModule):
             self.args.rouge_path,
             experiment_id=self.args.mips_cache_prefix,
         )
-
-        self.tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "return_tensors": "pt",
-            "max_length": self.args.model_tok_max_length
-        }
-
-        self.query_tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "return_tensors": "pt",
-            "max_length": self.args.query_tok_max_length
-        }
 
         self.filename = "output"
 
@@ -144,80 +143,38 @@ class LongformerLightning(pl.LightningModule):
                     False)
 
         if not self.args.mips_no_init_build and not self.args.mips_disabled:
+            self._init_mips_folder()
+            self.trainer.strategy.barrier()
             self.retriever_generator.encoder._build_mips_index(self.local_rank)
+            self.trainer.strategy.barrier()
 
     def on_train_batch_start(self, batch: dict, batch_idx: int, unused: int = 0) -> None:
         if not self.args.mips_no_init_build and not self.args.mips_disabled and not self.args.mips_freezed and not self.args.mips_encoder_freezed:
+            self._init_mips_folder()
+            self.trainer.strategy.barrier()
             self.retriever_generator.encoder._update_mips_index(
                 global_step=self.global_step,
                 local_rank=self.local_rank,
             )
+            self.trainer.strategy.barrier()
 
-    def _get_data_loader(self, mode: str, batch_size: int, select_indices: list = None) -> DataLoader:
-        if self.args.dataset_name == "multi_x_science":
-            if self.args.decoder_max_length is None:
-                decoder_max_length = self.retriever_generator.config.max_decoder_position_embeddings
-            else:
-                decoder_max_length = self.args.decoder_max_length
-            if self.args.multi_x_science_dataset_mode == "dual":
-                data = MultiXScienceDualDataset(
-                    args=self.args,
-                    mode=mode,
-                    tokenizer=self.retriever_generator.tokenizer,
-                    tokenizer_kwargs=self.tokenizer_kwargs,
-                    query_tokenizer=self.retriever_generator.encoder.query_tokenizer,
-                    query_tokenizer_kwargs=self.query_tokenizer_kwargs,
-                    select_indices=select_indices,
-                    decoder_max_length=decoder_max_length,
-                )
-            elif self.args.multi_x_science_dataset_mode == "original":
-                data = MultiXScienceDataset(
-                    args=self.args,
-                    mode=mode,
-                    tokenizer=self.retriever_generator.tokenizer,
-                    tokenizer_kwargs=self.tokenizer_kwargs,
-                    query_tokenizer=self.retriever_generator.encoder.query_tokenizer,
-                    query_tokenizer_kwargs=self.query_tokenizer_kwargs,
-                    select_indices=select_indices,
-                    decoder_max_length=decoder_max_length,
-                )
-            elif self.args.multi_x_science_dataset_mode == "aggregated":
-                data = MultiXScienceAggregatedDataset(
-                    args=self.args,
-                    mode=mode,
-                    tokenizer=self.retriever_generator.tokenizer,
-                    tokenizer_kwargs=self.tokenizer_kwargs,
-                    query_tokenizer=self.retriever_generator.encoder.query_tokenizer,
-                    query_tokenizer_kwargs=self.query_tokenizer_kwargs,
-                    select_indices=select_indices,
-                    decoder_max_length=decoder_max_length,
-                )
-        else:
-            assert False, "Unknown dataset name, please choose from these names : multi_x_science"
-        data_loader = DataLoader(
-            dataset=data,
-            batch_size=batch_size,
-            num_workers=self.args.data_workers,
-            shuffle=False,
-        )
-        return data_loader
-
-    def train_dataloader(self) -> DataLoader:
-        return self._get_data_loader("train", batch_size=self.args.batch_size)
+    @rank_zero_only
+    def _init_mips_folder(self):
+        shutil.rmtree(self.args.mips_tmp_folder, ignore_errors=True)
+        os.makedirs(self.args.mips_tmp_folder, exist_ok=True)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        decoder_input_ids: torch.Tensor,
-        decoder_attention_mask: torch.Tensor,
+        labels: torch.Tensor,
         query_input_ids: torch.Tensor,
         query_attention_mask: torch.Tensor,
         index: list,
         aid: list,
         aid_counts: torch.Tensor,
-        target_str: list,
-        input_str: list = None,
+        target: list,
+        input: list = None,
         **kwargs
     ):
 
@@ -231,18 +188,14 @@ class LongformerLightning(pl.LightningModule):
             mips_ignore_indexes=indices,
             aid=aid,
             aid_counts=aid_counts,
-            target_str=target_str,
-            input_str=input_str,
+            target_str=target,
+            input_str=input,
             return_dict=True,
             logger=self.log_dict,
         )
 
-        # decoder_input_ids_shifted = decoder_input_ids[:, :-1]
-        # target_shifted = decoder_input_ids[:, 1:].clone()
-
         decoder_input_ids_shifted = self.retriever_generator.model.prepare_decoder_input_ids_from_labels(
-            decoder_input_ids)
-        target_shifted = decoder_input_ids.clone()
+            labels)
 
         decoder_head_outputs = self.retriever_generator(
             input_ids=decoder_input_ids_shifted,
@@ -288,7 +241,7 @@ class LongformerLightning(pl.LightningModule):
                 sync_dist=True,
             )
 
-        return lprobs, target_shifted
+        return lprobs
 
     def training_step(self, batch, batch_idx):
         self.train()
@@ -298,20 +251,22 @@ class LongformerLightning(pl.LightningModule):
             self.retriever_generator.encoder.mips.encoder.train(
                 not (self.args.mips_freezed or self.args.mips_encoder_freezed))
 
-        lprobs, target_shifted = self(**batch)
+        log_probs = self(**batch)
 
         loss = label_smoothed_nll_loss_transformers(
-            log_probs=-lprobs,
-            labels=target_shifted,
+            log_probs=-
+            log_probs.view(-1, len(self.retriever_generator.tokenizer)),
+            labels=batch['labels'].view(-1),
             epsilon=self.args.label_smoothing_eps,
             ignore_index=self.retriever_generator.pad_token_id,
         )
 
-        self.losses.append(loss.item())
-        if len(self.losses) == self.trainer.accumulate_grad_batches:
-            self.log('train_loss', np.mean(self.losses), prog_bar=False,
-                     on_step=True, sync_dist=True, on_epoch=False)
-            self.losses.clear()
+        self.log(
+            'loss',
+            loss.item(),
+            prog_bar=True,
+            sync_dist=True,
+        )
 
         return loss
 
@@ -327,13 +282,10 @@ class LongformerLightning(pl.LightningModule):
 
         output = self.retriever_generator.generate(
             inputs=batch['input_ids'],
-            max_length=self.args.generate_max_length,
-            min_length=self.args.generate_min_length,
-            no_repeat_ngram_size=self.args.generate_no_repeat_ngram_size,
-            length_penalty=self.args.generate_length_penalty,
-            num_beams=self.args.num_beams,
-            do_sample=False,
-            use_cache=self.args.use_cache,
+            generation_config=self.generation_config,
+            pad_token_id=self.retriever_generator.tokenizer.pad_token_id,
+            decoder_start_token_id=self.retriever_generator.config.decoder_start_token_id,
+            use_cache=True,
             return_dict_in_generate=True,
             output_scores=True,
             **kwargs,
@@ -347,8 +299,7 @@ class LongformerLightning(pl.LightningModule):
 
         predictions = self.retriever_generator.tokenizer.batch_decode(
             output.sequences, skip_special_tokens=True)
-        references = self.retriever_generator.tokenizer.batch_decode(
-            batch['decoder_input_ids'], skip_special_tokens=True)
+        references = batch['target']
 
         current_examples = None
         if hasattr(self.retriever_generator.encoder, "mips"):
@@ -376,9 +327,6 @@ class LongformerLightning(pl.LightningModule):
 
         return output
 
-    def val_dataloader(self) -> DataLoader:
-        return self._get_data_loader("validation", batch_size=self.args.validation_batch_size)
-
     def validation_step(self, batch, batch_idx) -> dict:
         output = self.predict_step(batch, batch_idx)
         self.validation_step_outputs.append(output)
@@ -398,9 +346,6 @@ class LongformerLightning(pl.LightningModule):
             json.dump(self.validation_step_outputs, f)
 
         self.validation_step_outputs.clear()
-
-    def test_dataloader(self) -> DataLoader:
-        return self._get_data_loader("test", batch_size=self.args.batch_size)
 
     def test_step(self, batch, batch_idx) -> dict:
         output = self.predict_step(batch, batch_idx)

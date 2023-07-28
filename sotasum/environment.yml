@@ -21,7 +21,8 @@ dependencies:
       - tensorboard
       - deepspeed
       - fairscale
-      - transformers<4.23.0
+      - transformers
+      - sentencepiece
       - datasets
       - evaluate
       - pandas
@@ -32,4 +33,3 @@ dependencies:
       - rouge-score
       - rich
       - pymsteams
-      - tensorboard
