@@ -1,0 +1,176 @@
+# pytorch_lightning==2.0.5
+seed_everything: true
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: 16-mixed
+  logger:
+    - class_path: pytorch_lightning.loggers.MLFlowLogger
+      init_args:
+        experiment_name: traindevrun_sotasum
+        tracking_uri: file:mlruns
+    - class_path: pytorch_lightning.loggers.TensorBoardLogger
+      init_args:
+        save_dir: lightning_logs
+        log_graph: true
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: ../checkpoint/
+        save_top_k: 1
+        monitor: rouge1
+        mode: max
+        filename: "{epoch}-{rouge1:.2f}"
+  fast_dev_run: false
+  max_epochs: null
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: null
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: null
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+ckpt_path: null
+model:
+  class_path: lightning_model.RetrieverGeneratorLightning
+  init_args:
+    model_config:
+      log_retriever_metrics: false
+      log_copy_metrics: false
+      validation_batch_size: 16
+      validation_outputs_dir: ./outputs/
+      rouge_path: rouge
+      lr: 3.0e-05
+      batch_size: 16
+      warmup_steps: 1000
+      total_steps: 5000
+      model_name: allenai/led-base-16384
+      copy_decoder_layers: 8
+      join_method: concat_start_wdoc_global
+      attention_mode: sliding_chunks
+      query_encoder_path: allenai/longformer-base-4096
+      query_state_dict: null
+      label_smoothing_eps: 0.1
+      use_own_decoder: false
+      gradient_checkpointing: false
+      output_copy_probs: false
+      gates_mode: nmt
+      skip_residual: false
+      memory_forcing: no_forcing
+      use_attention_mask: false
+      memory_model_name: allenai/longformer-base-4096
+      memory_tok_max_length: null
+      mips_disabled: false
+      mips_freezed: false
+      mips_encoder_freezed: false
+      mips_batch_size: 32
+      mips_num_gpus: 1
+      mips_topk: 2
+      mips_string_factory: IVF256,SQ8
+      mips_nprobe: null
+      mips_rebuild_every: 10000
+      mips_train_size: -1
+      mips_metric_type: 0
+      mips_dataset: multi_x_science
+      mips_arxiv_data_path: null
+      mips_data_script_path: multi_x_science_sum
+      mips_model_name: allenai/longformer-base-4096
+      mips_state_dict: null
+      mips_no_init_build: false
+      mips_db_max_size: null
+      mips_tok_max_length: null
+      mips_tmp_max_norm_file: max_norm.pkl
+      mips_tmp_index_file: index.faiss
+      mips_tmp_embeddings_folder: embeddings
+      mips_tmp_folder: ./tmp
+      mips_cache_prefix: ""
+      multi_x_science_dataset_mode: original
+      doc_sep: <DOC_SEP>
+      copy_forcing: 0.0
+      source_memory: false
+    generation_config:
+      class_path: transformers.GenerationConfig
+      init_args:
+        max_length: 20
+        max_new_tokens: null
+        min_length: 0
+        min_new_tokens: null
+        early_stopping: false
+        max_time: null
+        do_sample: false
+        num_beams: 1
+        num_beam_groups: 1
+        penalty_alpha: null
+        use_cache: true
+        temperature: 1.0
+        top_k: 50
+        top_p: 1.0
+        typical_p: 1.0
+        epsilon_cutoff: 0.0
+        eta_cutoff: 0.0
+        diversity_penalty: 0.0
+        repetition_penalty: 1.0
+        encoder_repetition_penalty: 1.0
+        length_penalty: 1.0
+        no_repeat_ngram_size: 0
+        bad_words_ids: null
+        force_words_ids: null
+        renormalize_logits: false
+        constraints: null
+        forced_bos_token_id: null
+        forced_eos_token_id: null
+        remove_invalid_values: false
+        exponential_decay_length_penalty: null
+        suppress_tokens: null
+        begin_suppress_tokens: null
+        forced_decoder_ids: null
+        sequence_bias: null
+        guidance_scale: null
+        num_return_sequences: 1
+        output_attentions: false
+        output_hidden_states: false
+        output_scores: false
+        return_dict_in_generate: false
+        pad_token_id: null
+        bos_token_id: null
+        eos_token_id: null
+        encoder_no_repeat_ngram_size: 0
+        decoder_start_token_id: null
+        generation_kwargs: {}
+        transformers_version: null
+data:
+  class_path: data_modules.RGMultiXScienceDataModule
+  init_args:
+    path: multi_x_science_sum
+    save_path: ../data_hf/multixscience
+    aggregation: false
+    num_workers: 0
+    max_length: 1024
+    query_max_length: 1024
+    decoder_max_length: 1024
+    num_proc_tokenization: null
