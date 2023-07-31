@@ -82,7 +82,7 @@ class TeamsCallback(Callback):
         self.evaluation_msg("test", pl_module)
 
 
-class LongformerLightning(pl.LightningModule):
+class RetrieverGeneratorLightning(pl.LightningModule):
 
     def __init__(
         self,
