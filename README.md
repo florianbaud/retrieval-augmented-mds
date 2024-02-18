@@ -11,3 +11,7 @@ Then execute this command in _sotasum_ directory :
 ```bash
 $ conda env create
 ```
+
+## Paper
+
+[Non-Parametric Memory Guidance for Multi-Document Summarization](https://aclanthology.org/2023.ranlp-1.17) (Baud & Aussem, RANLP 2023)
