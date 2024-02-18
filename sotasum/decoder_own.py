@@ -5,7 +5,7 @@ import rich
 
 from typing import List, Optional, Tuple, Union
 from transformers.models.led.modeling_led import (
-    _expand_mask,
+    _prepare_4d_attention_mask_inverted,
     BaseModelOutputWithPastAndCrossAttentions,
 )
 from transformers.activations import ACT2FN
@@ -44,7 +44,11 @@ class LEDDecoderAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     def forward(
         self,
@@ -96,8 +100,7 @@ class LEDDecoderAttention(nn.Module):
             past_key_value = (key_states, value_states)
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(
-            query_states, tgt_len, bsz).view(*proj_shape)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
@@ -105,8 +108,10 @@ class LEDDecoderAttention(nn.Module):
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         ##### Bias attention weights #####
-        attn_weights += (self.beta * attention_bias.view(
-            attention_bias.shape[0], 1, -1) + self.beta_bias)
+        attn_weights += (
+            self.beta * attention_bias.view(attention_bias.shape[0], 1, -1)
+            + self.beta_bias
+        )
         ##################################
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
@@ -120,10 +125,11 @@ class LEDDecoderAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights.view(
-                bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = attn_weights.view(
-                bsz * self.num_heads, tgt_len, src_len)
+            attn_weights = (
+                attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                + attention_mask
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         if layer_head_mask is not None:
@@ -132,10 +138,10 @@ class LEDDecoderAttention(nn.Module):
                     f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
                     f" {layer_head_mask.size()}"
                 )
-            attn_weights = layer_head_mask.view(
-                1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(
-                bsz * self.num_heads, tgt_len, src_len)
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if output_attentions:
             # this operation is a bit awkward, but it's required to
@@ -143,14 +149,17 @@ class LEDDecoderAttention(nn.Module):
             # In order to do so, attn_weights have to be reshaped
             # twice and have to be reused in the following
             attn_weights_reshaped = attn_weights.view(
-                bsz, self.num_heads, tgt_len, src_len)
+                bsz, self.num_heads, tgt_len, src_len
+            )
             attn_weights = attn_weights_reshaped.view(
-                bsz * self.num_heads, tgt_len, src_len)
+                bsz * self.num_heads, tgt_len, src_len
+            )
         else:
             attn_weights_reshaped = None
 
         attn_probs = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training)
+            attn_weights, p=self.dropout, training=self.training
+        )
 
         attn_output = torch.bmm(attn_probs, value_states)
 
@@ -172,7 +181,6 @@ class LEDDecoderAttention(nn.Module):
 
 
 class CopyDecoderLayer(nn.Module):
-
     def __init__(self, config) -> None:
         super().__init__()
         self.embed_dim = config.d_model
@@ -218,9 +226,14 @@ class CopyDecoderLayer(nn.Module):
             residual = hidden_states
 
             # cross_attn cached key/values tuple is at positions 3,4 of present_key_value tuple
-            cross_attn_past_key_value = past_key_value[-2:
-                                                       ] if past_key_value is not None else None
-            hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
+            cross_attn_past_key_value = (
+                past_key_value[-2:] if past_key_value is not None else None
+            )
+            (
+                hidden_states,
+                cross_attn_weights,
+                cross_attn_present_key_value,
+            ) = self.encoder_attn(
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
@@ -230,7 +243,8 @@ class CopyDecoderLayer(nn.Module):
                 output_attentions=output_attentions,
             )
             hidden_states = nn.functional.dropout(
-                hidden_states, p=self.dropout, training=self.training)
+                hidden_states, p=self.dropout, training=self.training
+            )
 
             ############# HACK ##############
             self_attn_weights = hidden_states
@@ -246,11 +260,15 @@ class CopyDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.activation_fn(self.fc1(hidden_states))
         hidden_states = nn.functional.dropout(
-            hidden_states, p=self.activation_dropout, training=self.training)
+            hidden_states, p=self.activation_dropout, training=self.training
+        )
         hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(
-            hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states if not self.skip_residual else hidden_states
+            hidden_states, p=self.dropout, training=self.training
+        )
+        hidden_states = (
+            residual + hidden_states if not self.skip_residual else hidden_states
+        )
         hidden_states = self.final_layer_norm(hidden_states)
 
         outputs = (hidden_states,)
@@ -265,12 +283,12 @@ class CopyDecoderLayer(nn.Module):
 
 
 class CopyDecoder(nn.Module):
-
     def __init__(self, config) -> None:
         super().__init__()
 
         self.layers = nn.ModuleList(
-            [CopyDecoderLayer(config) for _ in range(config.decoder_layers)])
+            [CopyDecoderLayer(config) for _ in range(config.decoder_layers)]
+        )
         # self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -292,10 +310,10 @@ class CopyDecoder(nn.Module):
         output_hidden_states=None,
         return_dict=None,
     ):
-
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
@@ -303,7 +321,8 @@ class CopyDecoder(nn.Module):
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError(
-                "You have to specify either decoder_input_ids or decoder_inputs_embeds")
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
 
         past_key_values_length = 0
 
@@ -317,16 +336,19 @@ class CopyDecoder(nn.Module):
 
         if attention_mask is not None and combined_attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            combined_attention_mask = combined_attention_mask + _expand_mask(
-                attention_mask,
-                inputs_embeds.dtype,
-                tgt_len=input_shape[-1],
+            combined_attention_mask = (
+                combined_attention_mask
+                + _prepare_4d_attention_mask_inverted(
+                    attention_mask,
+                    inputs_embeds.dtype,
+                    tgt_len=input_shape[-1],
+                )
             )
 
         # expand encoder attention mask
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            encoder_attention_mask = _expand_mask(
+            encoder_attention_mask = _prepare_4d_attention_mask_inverted(
                 encoder_attention_mask,
                 inputs_embeds.dtype,
                 tgt_len=input_shape[-1],
@@ -341,11 +363,9 @@ class CopyDecoder(nn.Module):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
-
             past_key_value = None
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     # logger.warning(
                     #     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -367,7 +387,9 @@ class CopyDecoder(nn.Module):
                     encoder_hidden_states,
                     encoder_attention_mask,
                     head_mask[idx] if head_mask is not None else None,
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
+                    cross_attn_head_mask[idx]
+                    if cross_attn_head_mask is not None
+                    else None,
                     None,
                 )
             else:
@@ -377,10 +399,11 @@ class CopyDecoder(nn.Module):
                     attention_bias=attention_bias,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
-                    layer_head_mask=(
-                        head_mask[idx] if head_mask is not None else None),
+                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     cross_attn_layer_head_mask=(
-                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                        cross_attn_head_mask[idx]
+                        if cross_attn_head_mask is not None
+                        else None
                     ),
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
@@ -390,8 +413,7 @@ class CopyDecoder(nn.Module):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (
-                    layer_outputs[3 if output_attentions else 1],)
+                next_decoder_cache += (layer_outputs[3 if output_attentions else 1],)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -405,20 +427,25 @@ class CopyDecoder(nn.Module):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
+                for v in [
+                    hidden_states,
+                    next_cache,
+                    all_hidden_states,
+                    all_self_attns,
+                    all_cross_attentions,
+                ]
                 if v is not None
             )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-            cross_attentions=all_cross_attentions,
+            attentions=all_self_attns,  # hidden_states before residual and ffn
+            cross_attentions=all_cross_attentions,  # attn_weigths
         )
 
 
 class DecoderForCopyGeneration(nn.Module):
-
     def __init__(self, args, config) -> None:
         super().__init__()
         self.args = args
@@ -428,9 +455,9 @@ class DecoderForCopyGeneration(nn.Module):
 
         embed_dim = config.d_model
 
-        if self.gates_attn in ['nmt', 'both']:
-            diverter_dim = embed_dim*2
-        elif self.gates_attn == 'onlycopy':
+        if self.gates_attn in ["nmt", "both"]:
+            diverter_dim = embed_dim * 2
+        elif self.gates_attn == "onlycopy":
             diverter_dim = embed_dim
 
         self.decoder = CopyDecoder(config)
@@ -453,7 +480,6 @@ class DecoderForCopyGeneration(nn.Module):
         encoder_hidden_states: torch.Tensor = None,  # Memory hidden_states
         encoder_attention_mask: torch.Tensor = None,  # Memory attention_mask
     ):
-
         # # batch_size x (seq_len * mips_topk)
         # print("Copy sequence shape :", copy_sequence.shape)
         # # batch_size x (tgt_len - 1) x hidden_size
@@ -509,7 +535,7 @@ class DecoderForCopyGeneration(nn.Module):
         gates = F.softmax(self.diverter(gates_input), -1)
         gen_gate, copy_gate = gates.chunk(2, dim=-1)
 
-        copy_probs = (copy_gate * alignment_weight)
+        copy_probs = copy_gate * alignment_weight
 
         return gen_gate, copy_gate, copy_probs
 

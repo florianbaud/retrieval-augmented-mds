@@ -17,6 +17,7 @@ def disable_progress_bar(f):
         if not datasets.is_progress_bar_enabled():
             datasets.enable_progress_bar()
         return d
+
     return wrapper
 
 
@@ -53,18 +54,24 @@ def load_mips_multi_x_science(
         df = df.apply(
             lambda x: {
                 **x.to_dict(),
-                "ref_abstract_abstract": x['ref_abstract']['abstract'],
+                "ref_abstract_abstract": x["ref_abstract"]["abstract"],
             },
             axis=1,
-            result_type='expand',
+            result_type="expand",
         ).explode(["ref_abstract_abstract"])
 
-        df = df[df['ref_abstract_abstract'] != ""].reset_index()
+        df = df[df["ref_abstract_abstract"] != ""].reset_index()
 
-        df = df.groupby("ref_abstract_abstract").agg({
-            "index": lambda x: x.to_list(),
-            "aid": lambda x: x.to_list(),
-        }).reset_index()
+        df = (
+            df.groupby("ref_abstract_abstract")
+            .agg(
+                {
+                    "index": lambda x: x.to_list(),
+                    "aid": lambda x: x.to_list(),
+                }
+            )
+            .reset_index()
+        )
 
         df.rename(
             columns={"ref_abstract_abstract": "mips_column"},
@@ -73,9 +80,11 @@ def load_mips_multi_x_science(
 
         data = Dataset.from_pandas(df)
     else:
+
         def remove_cite(example):
-            example['mips_column'] = re.sub(
-                r"\@cite_\d+", "cite", example["related_work"])
+            example["mips_column"] = re.sub(
+                r"\@cite_\d+", "cite", example["related_work"]
+            )
             return example
 
         data = data.map(
@@ -94,14 +103,13 @@ def load_mips_arxiv(data_path: str) -> Dataset:
     data = concatenate_datasets(list(data.values()))
 
     def join_clean(text: list) -> dict:
-        abstract_text = " ".join(text).replace('<S>', "").replace('</S>', "")
+        abstract_text = " ".join(text).replace("<S>", "").replace("</S>", "")
         abstract_text = re.sub(r"\s{2,}", " ", abstract_text)
         abstract_text = abstract_text.strip()
         return abstract_text
 
     data = data.map(
-        lambda x: {"abstract_text_str": [
-            join_clean(a) for a in x['abstract_text']]},
+        lambda x: {"abstract_text_str": [join_clean(a) for a in x["abstract_text"]]},
         desc="Cleaning data",
         batched=True,
         load_from_cache_file=False,
@@ -109,12 +117,44 @@ def load_mips_arxiv(data_path: str) -> Dataset:
 
     data = data.rename_columns(
         column_mapping={
-            "article_id": 'aid',
+            "article_id": "aid",
             "abstract_text_str": "mips_column",
         }
     )
 
     return data
+
+
+# @disable_progress_bar
+def load_mips_arxiv2(data_path: str) -> Dataset:
+    ds = Dataset.from_parquet(data_path)
+
+    def clean_arxiv(text: str) -> str:
+        text = text.replace("\n", " ").strip()
+        text = re.sub(r"\$+(.*?)\$+|\\\[(.*?)\\\]", "@math", text)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text
+
+    ds = ds.map(
+        lambda x: {"abstract_clean": [clean_arxiv(a) for a in x["abstract"]]},
+        batched=True,
+        load_from_cache_file=False,
+        desc="Cleaning data",
+        num_proc=4,
+    )
+
+    ds = ds.rename_columns(
+        column_mapping={
+            "__index_level_0__": "aid",
+            "abstract_clean": "mips_column",
+        }
+    )
+
+    ds = Dataset.from_pandas(
+        ds.to_pandas().drop_duplicates(subset=["mips_column"]), preserve_index=False
+    )
+
+    return ds
 
 
 def load_mips_arxiv_x_science(
@@ -123,24 +163,35 @@ def load_mips_arxiv_x_science(
     multix_script_path: str,
     multix_column: str,
 ) -> Dataset:
-    data: Dataset = concatenate_datasets((
-        load_mips_arxiv(
-            data_path=arxiv_data_path,
-        ),
-        load_mips_multi_x_science(
-            data_path=multix_data_path,
-            script_path=multix_script_path,
-            column=multix_column,
+    data: Dataset = concatenate_datasets(
+        (
+            load_mips_arxiv(
+                data_path=arxiv_data_path,
+            ),
+            load_mips_multi_x_science(
+                data_path=multix_data_path,
+                script_path=multix_script_path,
+                column=multix_column,
+            ),
         )
-    )).remove_columns(
-        column_names=['related_work', 'abstract', 'mid', 'ref_abstract', 'index',
-                      'article_text', 'abstract_text', 'labels', 'section_names', 'sections'],
+    ).remove_columns(
+        column_names=[
+            "related_work",
+            "abstract",
+            "mid",
+            "ref_abstract",
+            "index",
+            "article_text",
+            "abstract_text",
+            "labels",
+            "section_names",
+            "sections",
+        ],
     )
     return data
 
 
 class MultiXScienceDataset(TorchDataset):
-
     def __init__(
         self,
         args,
@@ -152,7 +203,6 @@ class MultiXScienceDataset(TorchDataset):
         select_indices: list = None,
         decoder_max_length: int = 1024,
     ) -> None:
-
         self.args = args
 
         self.data = load_multi_x_science(
@@ -161,9 +211,9 @@ class MultiXScienceDataset(TorchDataset):
         )[mode].to_pandas()
 
         self.data = self.data.merge(
-            self.data['aid'].value_counts(),
+            self.data["aid"].value_counts(),
             right_index=True,
-            left_on='aid',
+            left_on="aid",
         )
         self.data.rename(columns={"count": "aid_counts"}, inplace=True)
 
@@ -184,7 +234,7 @@ class MultiXScienceDataset(TorchDataset):
         self.tokenizer_kwargs = tokenizer_kwargs
 
         self.decoder_tokenizer_kwargs = tokenizer_kwargs.copy()
-        self.decoder_tokenizer_kwargs['max_length'] = decoder_max_length + 1
+        self.decoder_tokenizer_kwargs["max_length"] = decoder_max_length + 1
 
         self.query_tokenizer = query_tokenizer
         self.query_tokenizer_kwargs = query_tokenizer_kwargs
@@ -197,11 +247,10 @@ class MultiXScienceDataset(TorchDataset):
         item = self.data[index]
 
         if self.args.source_memory:
-            encoder_input = item['abstract']
+            encoder_input = item["abstract"]
         else:
-            encoder_input = [item['abstract']]
-            encoder_input += [a for a in item['ref_abstract']
-                              ['abstract'] if a != ""]
+            encoder_input = [item["abstract"]]
+            encoder_input += [a for a in item["ref_abstract"]["abstract"] if a != ""]
             encoder_input = self.doc_sep.join(encoder_input)
 
         encoder_input = self.tokenizer(
@@ -211,21 +260,19 @@ class MultiXScienceDataset(TorchDataset):
         encoder_input = {k: v.squeeze() for k, v in encoder_input.items()}
 
         if self.args.source_memory:
-            query_input = [item['abstract']]
-            query_input += [a for a in item['ref_abstract']
-                            ['abstract'] if a != ""]
+            query_input = [item["abstract"]]
+            query_input += [a for a in item["ref_abstract"]["abstract"] if a != ""]
             query_input = " ".join(query_input)
         else:
-            query_input = item['abstract']
+            query_input = item["abstract"]
 
         query_input = self.query_tokenizer(
             query_input,
             **self.query_tokenizer_kwargs,
         )
-        query_input = {f"query_{k}": v.squeeze()
-                       for k, v in query_input.items()}
+        query_input = {f"query_{k}": v.squeeze() for k, v in query_input.items()}
 
-        decoder_input = re.sub(r"\@cite_\d+", "cite", item['related_work'])
+        decoder_input = re.sub(r"\@cite_\d+", "cite", item["related_work"])
 
         target_str = {"target_str": decoder_input}
 
@@ -233,21 +280,27 @@ class MultiXScienceDataset(TorchDataset):
             decoder_input,
             **self.decoder_tokenizer_kwargs,
         )
-        decoder_input = {f"decoder_{k}": v.squeeze(
-        )[1:] for k, v in decoder_input.items()}
+        decoder_input = {
+            f"decoder_{k}": v.squeeze()[1:] for k, v in decoder_input.items()
+        }
 
         item_index = {
-            "index": item['index'],
-            "aid": item['aid'],
-            "aid_counts": item['aid_counts'],
+            "index": item["index"],
+            "aid": item["aid"],
+            "aid_counts": item["aid_counts"],
             "abstract": item["abstract"],
         }
 
-        return {**encoder_input, **query_input, **decoder_input, **item_index, **target_str}
+        return {
+            **encoder_input,
+            **query_input,
+            **decoder_input,
+            **item_index,
+            **target_str,
+        }
 
 
 class MultiXScienceDualDataset(MultiXScienceDataset):
-
     def __init__(
         self,
         args,
@@ -276,9 +329,8 @@ class MultiXScienceDualDataset(MultiXScienceDataset):
     def __getitem__(self, index) -> dict:
         item = self.data[index]
 
-        encoder_input = [item['abstract']]
-        encoder_input += [a for a in item['ref_abstract']
-                          ['abstract'] if a != ""]
+        encoder_input = [item["abstract"]]
+        encoder_input += [a for a in item["ref_abstract"]["abstract"] if a != ""]
         encoder_input_str = self.doc_sep.join(encoder_input)
 
         encoder_input = self.tokenizer(
@@ -287,16 +339,15 @@ class MultiXScienceDualDataset(MultiXScienceDataset):
         )
         encoder_input = {k: v.squeeze() for k, v in encoder_input.items()}
 
-        query_input = item['abstract']
+        query_input = item["abstract"]
 
         query_input = self.query_tokenizer(
             query_input,
             **self.query_tokenizer_kwargs,
         )
-        query_input = {f"query_{k}": v.squeeze()
-                       for k, v in query_input.items()}
+        query_input = {f"query_{k}": v.squeeze() for k, v in query_input.items()}
 
-        decoder_input = re.sub(r"\@cite_\d+", "cite", item['related_work'])
+        decoder_input = re.sub(r"\@cite_\d+", "cite", item["related_work"])
 
         target_str = {"target_str": decoder_input}
 
@@ -304,21 +355,27 @@ class MultiXScienceDualDataset(MultiXScienceDataset):
             decoder_input,
             **self.decoder_tokenizer_kwargs,
         )
-        decoder_input = {f"decoder_{k}": v.squeeze(
-        )[1:] for k, v in decoder_input.items()}
+        decoder_input = {
+            f"decoder_{k}": v.squeeze()[1:] for k, v in decoder_input.items()
+        }
 
         item_index = {
-            "index": item['index'],
-            "aid": item['aid'],
-            "aid_counts": item['aid_counts'],
+            "index": item["index"],
+            "aid": item["aid"],
+            "aid_counts": item["aid_counts"],
             "input_str": encoder_input_str,
         }
 
-        return {**encoder_input, **query_input, **decoder_input, **item_index, **target_str}
+        return {
+            **encoder_input,
+            **query_input,
+            **decoder_input,
+            **item_index,
+            **target_str,
+        }
 
 
 class MultiXScienceAggregatedDataset(MultiXScienceDataset):
-
     def __init__(
         self,
         args,
@@ -341,14 +398,23 @@ class MultiXScienceAggregatedDataset(MultiXScienceDataset):
             decoder_max_length,
         )
 
-        self.data = self.data.to_pandas().groupby("aid").agg({
-            "mid": lambda x: x.to_list()[0],
-            "abstract": lambda x: x.to_list()[0],
-            "ref_abstract": lambda x: {k: [j for i in x.to_list() for j in i[k] if bool(j)] for k in x.to_list()[0].keys()},
-            "related_work": lambda x: " ".join(x.to_list()),
-            "aid_counts": sum,
-            "index": lambda x: x.to_list()[0],
-        })
+        self.data = (
+            self.data.to_pandas()
+            .groupby("aid")
+            .agg(
+                {
+                    "mid": lambda x: x.to_list()[0],
+                    "abstract": lambda x: x.to_list()[0],
+                    "ref_abstract": lambda x: {
+                        k: [j for i in x.to_list() for j in i[k] if bool(j)]
+                        for k in x.to_list()[0].keys()
+                    },
+                    "related_work": lambda x: " ".join(x.to_list()),
+                    "aid_counts": sum,
+                    "index": lambda x: x.to_list()[0],
+                }
+            )
+        )
         self.data = Dataset.from_pandas(self.data, preserve_index=True)
         # self.data.rename_column()
 
@@ -360,7 +426,6 @@ class MultiXScienceAggregatedDataset(MultiXScienceDataset):
 
 
 class PretrainMultiXScienceDataset(TorchDataset):
-
     def __init__(
         self,
         args,
@@ -388,26 +453,28 @@ class PretrainMultiXScienceDataset(TorchDataset):
         self.mips_tokenizer_kwargs.update(tokenizer_kwargs)
 
         self.data = load_dataset(
-            'multi_x_science_sum',
+            "multi_x_science_sum",
             cache_dir=self.args.data_path,
         )[self.mode].to_pandas()
 
         self.data = self.data.merge(
-            self.data['aid'].value_counts(),
+            self.data["aid"].value_counts(),
             right_index=True,
-            left_on='aid',
-            suffixes=('', '_counts'),
+            left_on="aid",
+            suffixes=("", "_counts"),
         )
 
         if self.mode == "train":
-            self.data = self.data.groupby(by='mid').agg({
-                "aid": lambda x: x.to_list()[0],
-                "aid_counts": lambda x: x.to_list()[0],
-                "abstract": lambda x: x.to_list()[0],
-                "related_work": lambda x: x.to_list()
-            })
+            self.data = self.data.groupby(by="mid").agg(
+                {
+                    "aid": lambda x: x.to_list()[0],
+                    "aid_counts": lambda x: x.to_list()[0],
+                    "abstract": lambda x: x.to_list()[0],
+                    "related_work": lambda x: x.to_list(),
+                }
+            )
         else:
-            self.data.drop_duplicates(['aid'], inplace=True)
+            self.data.drop_duplicates(["aid"], inplace=True)
 
         self.data = Dataset.from_pandas(self.data, preserve_index=False)
 
@@ -420,18 +487,20 @@ class PretrainMultiXScienceDataset(TorchDataset):
     def __getitem__(self, index) -> dict:
         item = self.data[index]
 
-        query_input = item['abstract']
+        query_input = item["abstract"]
         # query_input = self.args.doc_sep.join(
         #     [item['abstract']] + item['ref_abstract']['abstract'])
         query_input = self.query_tokenizer(
             query_input,
             **self.query_tokenizer_kwargs,
         )
-        query_input = {f"query_{k}": v.squeeze()
-                       for k, v in query_input.items()}
+        query_input = {f"query_{k}": v.squeeze() for k, v in query_input.items()}
 
-        mips_input = random.choice(
-            item['related_work']) if self.mode == "train" else item['related_work']
+        mips_input = (
+            random.choice(item["related_work"])
+            if self.mode == "train"
+            else item["related_work"]
+        )
         mips_input = re.sub(r"\@cite_\d+", "cite", mips_input)
         mips_input = self.mips_tokenizer(
             mips_input,
@@ -440,7 +509,7 @@ class PretrainMultiXScienceDataset(TorchDataset):
         mips_input = {f"mips_{k}": v.squeeze() for k, v in mips_input.items()}
 
         index_input = {
-            "aid": item['aid'],
+            "aid": item["aid"],
             "counts": item["aid_counts"],
             "abstract": item["abstract"],
         }
@@ -449,7 +518,6 @@ class PretrainMultiXScienceDataset(TorchDataset):
 
 
 class PretrainAbstractMultiXScienceDataset(TorchDataset):
-
     def __init__(
         self,
         args,
@@ -477,17 +545,23 @@ class PretrainAbstractMultiXScienceDataset(TorchDataset):
         self.mips_tokenizer_kwargs.update(tokenizer_kwargs)
 
         self.data = load_dataset(
-            'multi_x_science_sum',
+            "multi_x_science_sum",
             cache_dir=self.args.data_path,
         )[self.mode].to_pandas()
 
-        self.data = self.data.groupby("mid").agg({
-            "aid": lambda x: x.to_list()[0],
-            "abstract": lambda x: x.to_list()[0],
-            "ref_abstract": lambda x: {k: [j for i in x.to_list() for j in i[k] if bool(j)] for k in x.to_list()[0].keys()},
-        })
-        self.data['counts'] = self.data['ref_abstract'].apply(
-            lambda x: len(x['abstract']))
+        self.data = self.data.groupby("mid").agg(
+            {
+                "aid": lambda x: x.to_list()[0],
+                "abstract": lambda x: x.to_list()[0],
+                "ref_abstract": lambda x: {
+                    k: [j for i in x.to_list() for j in i[k] if bool(j)]
+                    for k in x.to_list()[0].keys()
+                },
+            }
+        )
+        self.data["counts"] = self.data["ref_abstract"].apply(
+            lambda x: len(x["abstract"])
+        )
 
         self.data = Dataset.from_pandas(self.data, preserve_index=False)
 
@@ -500,15 +574,14 @@ class PretrainAbstractMultiXScienceDataset(TorchDataset):
     def __getitem__(self, index) -> dict:
         item = self.data[index]
 
-        query_input = item['abstract']
+        query_input = item["abstract"]
         query_input = self.query_tokenizer(
             query_input,
             **self.query_tokenizer_kwargs,
         )
-        query_input = {f"query_{k}": v.squeeze()
-                       for k, v in query_input.items()}
+        query_input = {f"query_{k}": v.squeeze() for k, v in query_input.items()}
 
-        mips_input = random.choice(item['ref_abstract']['abstract'])
+        mips_input = random.choice(item["ref_abstract"]["abstract"])
         # mips_input = re.sub(r"\@cite_\d+", "cite", mips_input)
         mips_input = self.mips_tokenizer(
             mips_input,
@@ -517,7 +590,7 @@ class PretrainAbstractMultiXScienceDataset(TorchDataset):
         mips_input = {f"mips_{k}": v.squeeze() for k, v in mips_input.items()}
 
         index_input = {
-            "aid": item['aid'],
+            "aid": item["aid"],
             "counts": item["counts"],
             "abstract": item["abstract"],
         }
@@ -552,6 +625,6 @@ def get_args(args: str = None) -> argparse.Namespace:
     return args
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = get_args()
     args.func(args)

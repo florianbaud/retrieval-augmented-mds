@@ -1,22 +1,20 @@
-import numpy as np
 import json
 import pytorch_lightning as pl
-import torch.nn.functional as F
 import torch
 import pymsteams
-import os
-import shutil
 import rich
 
-from model_config import ModelConfig
+from .model_config import ModelConfig
+from .retriever_generator import RetrieverGenerator, RGEncoderModelOutput
+from .loss import label_smoothed_nll_loss_transformers
+from time import time
+from pathlib import Path
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.strategies import DeepSpeedStrategy
-from retriever_generator import RetrieverGenerator
 from transformers import get_linear_schedule_with_warmup, GenerationConfig
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from evaluate import load
-from loss import label_smoothed_nll_loss_transformers
 
 
 def fault_tolerant(func):
@@ -26,18 +24,19 @@ def fault_tolerant(func):
         except:
             return None
         return x
+
     return wrapper
 
 
 class GradientsPrintingCallback(Callback):
-
-    def on_after_backward(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_after_backward(
+        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+    ) -> None:
         for n, p in pl_module.named_parameters():
             pl_module.print(n, ":", p.grad)
 
 
 class TeamsCallback(Callback):
-
     def __init__(self, hookurl: str) -> None:
         super().__init__()
         self.hookurl = hookurl
@@ -56,7 +55,7 @@ class TeamsCallback(Callback):
                 section.addFact(k, v)
             msg.addSection(section)
 
-        msg.text(f'Check out {stage} summary :')
+        msg.text(f"Check out {stage} summary :")
         msg.send()
 
     @fault_tolerant
@@ -69,21 +68,27 @@ class TeamsCallback(Callback):
 
     @fault_tolerant
     @rank_zero_only
-    def on_exception(self, trainer: pl.Trainer, pl_module: pl.LightningModule, exception: BaseException) -> None:
+    def on_exception(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        exception: BaseException,
+    ) -> None:
         msg = pymsteams.connectorcard(hookurl=self.hookurl)
         msg.title("❌ Training exception")
-        msg.text(f'An error occured : \n{exception}')
+        msg.text(f"An error occured : \n{exception}")
         msg.send()
 
-    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    def on_validation_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
         self.evaluation_msg("validation", pl_module)
 
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.evaluation_msg("test", pl_module)
 
 
-class RetrieverGeneratorLightning(pl.LightningModule):
-
+class LongformerLightning(pl.LightningModule):
     def __init__(
         self,
         model_config: ModelConfig = ModelConfig(),
@@ -104,7 +109,8 @@ class RetrieverGeneratorLightning(pl.LightningModule):
             experiment_id=self.args.mips_cache_prefix,
         )
 
-        self.filename = "output"
+        self.validation_outputs_path = Path(self.args.validation_outputs_dir)
+        self.validation_outputs_path.mkdir(parents=True, exist_ok=True)
 
         # self.example_input_array = {
         #     'input_ids': torch.ones((2, 5)).long(),
@@ -134,34 +140,50 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         if stage == "fit":
             # self._log_params()
             if self.args.mips_freezed and not self.args.mips_disabled:
-                self.retriever_generator.encoder.mips.encoder.requires_grad_(
-                    False)
-                self.retriever_generator.encoder.query_encoder.requires_grad_(
-                    False)
+                self.retriever_generator.encoder.mips.encoder.requires_grad_(False)
+                self.retriever_generator.encoder.query_encoder.requires_grad_(False)
             elif self.args.mips_encoder_freezed and not self.args.mips_disabled:
-                self.retriever_generator.encoder.mips.encoder.requires_grad_(
-                    False)
+                self.retriever_generator.encoder.mips.encoder.requires_grad_(False)
 
+    def on_train_batch_start(
+        self, batch: dict, batch_idx: int, unused: int = 0
+    ) -> None:
         if not self.args.mips_no_init_build and not self.args.mips_disabled:
-            self._init_mips_folder()
-            self.trainer.strategy.barrier()
-            self.retriever_generator.encoder._build_mips_index(self.local_rank)
-            self.trainer.strategy.barrier()
-
-    def on_train_batch_start(self, batch: dict, batch_idx: int, unused: int = 0) -> None:
-        if not self.args.mips_no_init_build and not self.args.mips_disabled and not self.args.mips_freezed and not self.args.mips_encoder_freezed:
-            self._init_mips_folder()
-            self.trainer.strategy.barrier()
-            self.retriever_generator.encoder._update_mips_index(
-                global_step=self.global_step,
-                local_rank=self.local_rank,
+            is_update_step = self.global_step % self.args.mips_rebuild_every == 0
+            is_step_built = (
+                self.global_step in self.retriever_generator.encoder.mips.rebuilt_steps
             )
-            self.trainer.strategy.barrier()
+            if (
+                not self.args.mips_freezed
+                and not self.args.mips_encoder_freezed
+                and not is_step_built
+                and is_update_step
+            ):
+                self._build_mips_index2()
 
-    @rank_zero_only
-    def _init_mips_folder(self):
-        shutil.rmtree(self.args.mips_tmp_folder, ignore_errors=True)
-        os.makedirs(self.args.mips_tmp_folder, exist_ok=True)
+    def on_fit_start(self) -> None:
+        if not self.args.mips_no_init_build and not self.args.mips_disabled:
+            self._build_mips_index2()
+
+    def _build_mips_index2(self) -> None:
+        self.retriever_generator.encoder.mips.init_embeddings_folder()
+        self.trainer.strategy.barrier()
+        self.retriever_generator.encoder.mips.encode_text2(
+            rank=self.global_rank,
+            num_rank=self.trainer.num_devices * self.trainer.num_nodes,
+        )
+        self.trainer.strategy.barrier()
+        self.retriever_generator.encoder.mips.build_index()
+        self.retriever_generator.encoder.mips.save()
+        self.trainer.strategy.barrier()
+        self.retriever_generator.encoder.mips.rebuilt_steps.append(self.global_step)
+        self.retriever_generator.encoder.mips.load()
+
+    def on_predict_start(self) -> None:
+        self.on_fit_start()
+
+    def on_test_start(self) -> None:
+        self.on_fit_start()
 
     def forward(
         self,
@@ -175,9 +197,8 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         aid_counts: torch.Tensor,
         target: list,
         input: list = None,
-        **kwargs
+        **kwargs,
     ):
-
         indices = None if self.args.memory_forcing == "retrieved_forcing" else index
 
         encoder_outputs = self.retriever_generator.encoder(
@@ -194,8 +215,9 @@ class RetrieverGeneratorLightning(pl.LightningModule):
             logger=self.log_dict,
         )
 
-        decoder_input_ids_shifted = self.retriever_generator.model.prepare_decoder_input_ids_from_labels(
-            labels)
+        decoder_input_ids_shifted = (
+            self.retriever_generator.model.prepare_decoder_input_ids_from_labels(labels)
+        )
 
         decoder_head_outputs = self.retriever_generator(
             input_ids=decoder_input_ids_shifted,
@@ -204,15 +226,17 @@ class RetrieverGeneratorLightning(pl.LightningModule):
             encoder_attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
+            output_attentions=self.args.output_copy_probs,
         )
 
         if not self.args.mips_disabled:
             lprobs = decoder_head_outputs.logits
         else:
             lprobs = torch.nn.functional.log_softmax(
-                decoder_head_outputs.logits, dim=-1)
+                decoder_head_outputs.logits, dim=-1
+            )
 
-        if self.args.log_copy_metrics:
+        if self.args.log_copy_metrics and not self.args.mips_disabled:
             k = 10
             copy_gate: torch.Tensor = decoder_head_outputs.copy_gate
             copy_probs: torch.Tensor = decoder_head_outputs.copy_probs
@@ -222,10 +246,10 @@ class RetrieverGeneratorLightning(pl.LightningModule):
             all_max_copy_probs, all_index = copy_probs.max(2)
             topk_max_copy_probs, topk_index = all_max_copy_probs.topk(k)
 
-            topk_index = torch.div(all_index.gather(
-                1, topk_index), memory_length, rounding_mode="floor")
-            all_index = torch.div(
-                all_index, memory_length, rounding_mode="floor")
+            topk_index = torch.div(
+                all_index.gather(1, topk_index), memory_length, rounding_mode="floor"
+            )
+            all_index = torch.div(all_index, memory_length, rounding_mode="floor")
 
             self.log_dict(
                 {
@@ -247,22 +271,23 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         self.train()
         if not self.args.mips_disabled:
             self.retriever_generator.encoder.query_encoder.train(
-                not self.args.mips_freezed)
+                not self.args.mips_freezed
+            )
             self.retriever_generator.encoder.mips.encoder.train(
-                not (self.args.mips_freezed or self.args.mips_encoder_freezed))
+                not (self.args.mips_freezed or self.args.mips_encoder_freezed)
+            )
 
         log_probs = self(**batch)
 
         loss = label_smoothed_nll_loss_transformers(
-            log_probs=-
-            log_probs.view(-1, len(self.retriever_generator.tokenizer)),
-            labels=batch['labels'].view(-1),
+            log_probs=-log_probs.view(-1, len(self.retriever_generator.tokenizer)),
+            labels=batch["labels"].view(-1),
             epsilon=self.args.label_smoothing_eps,
             ignore_index=self.retriever_generator.pad_token_id,
         )
 
         self.log(
-            'loss',
+            "loss",
             loss.item(),
             prog_bar=True,
             sync_dist=True,
@@ -270,59 +295,72 @@ class RetrieverGeneratorLightning(pl.LightningModule):
 
         return loss
 
-    @torch.inference_mode()
     def generate(self, batch: dict):
         self.eval()
+
+        encoder_outputs: RGEncoderModelOutput = self.retriever_generator.encoder(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            query_input_ids=batch["query_input_ids"],
+            query_attention_mask=batch["query_attention_mask"],
+        )
         kwargs = {
+            "encoder_outputs": encoder_outputs,
             "attention_mask": batch["attention_mask"],
-            "query_input_ids": batch['query_input_ids'],
-            "query_attention_mask": batch["query_attention_mask"],
-            "input_str": batch.get('input_str', None)
         }
 
         output = self.retriever_generator.generate(
-            inputs=batch['input_ids'],
             generation_config=self.generation_config,
             pad_token_id=self.retriever_generator.tokenizer.pad_token_id,
             decoder_start_token_id=self.retriever_generator.config.decoder_start_token_id,
+            bos_token_id=self.retriever_generator.config.bos_token_id,
+            eos_token_id=self.retriever_generator.config.eos_token_id,
             use_cache=True,
             return_dict_in_generate=True,
             output_scores=True,
+            output_attentions=self.args.output_copy_probs,
             **kwargs,
         )
 
-        return output
+        return output, encoder_outputs
 
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> dict:
-        self.retriever_generator.copy_probs = tuple()
-        output = self.generate(batch)
+        output, encoder_outputs = self.generate(batch)
 
         predictions = self.retriever_generator.tokenizer.batch_decode(
-            output.sequences, skip_special_tokens=True)
-        references = batch['target']
+            output.sequences, skip_special_tokens=True
+        )
+        references = batch["target"]
 
-        current_examples = None
-        if hasattr(self.retriever_generator.encoder, "mips"):
-            current_examples = self.retriever_generator.encoder.mips.examples
+        tokens = [
+            self.retriever_generator.tokenizer.convert_ids_to_tokens(seq)
+            for seq in output.sequences
+        ]
 
-        tokens, tokens_copy_probs = None, None
-        if self.args.output_copy_probs and self.retriever_generator.copy_probs != None:
-            copy_probs = torch.cat(self.retriever_generator.copy_probs, 1)
+        tokens_sequence_copy_probs = output.get("cross_attentions", None)
+        tokens_copy_probs = None
+        if self.args.output_copy_probs:
             if hasattr(output, "beam_indices"):
-                copy_probs = torch.stack([copy_probs[output.beam_indices[:, i], i, :] for i in range(
-                    output.beam_indices.shape[1]-1)]).transpose(0, 1)
-
-            tokens_copy_probs = copy_probs.gather(
-                2, output.sequences[:, :-1].unsqueeze(-1)).squeeze().tolist()
-            tokens = [self.retriever_generator.tokenizer.convert_ids_to_tokens(
-                seq) for seq in output.sequences]
+                tokens_copy_probs = [
+                    [
+                        tokens_sequence_copy_probs[k][
+                            j, :, output.sequences[i, k + 1]
+                        ].item()
+                        if j != -1
+                        else 0.0
+                        for k, j in enumerate(output.beam_indices[i])
+                    ]
+                    for i in range(output.beam_indices.shape[0])
+                ]
 
         output = {
+            "query": batch["query_input"],
             "predictions": predictions,
             "references": references,
-            "examples": current_examples,
+            "examples": encoder_outputs.examples,
             "tokens": tokens,
             "tokens_copy_probs": tokens_copy_probs,
+            # "tokens_sequence_copy_probs": tokens_sequence_copy_probs, # High memory consomption
         }
 
         return output
@@ -331,8 +369,8 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         output = self.predict_step(batch, batch_idx)
         self.validation_step_outputs.append(output)
         self.rouge.add_batch(
-            predictions=output['predictions'],
-            references=output['references'],
+            predictions=output["predictions"],
+            references=output["references"],
         )
         return output
 
@@ -342,7 +380,10 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         for k, v in rouge_scores.items():
             self.log(k, v, sync_dist=True)
 
-        with open(f"./{self.filename}.json", mode="w") as f:
+        filename = (
+            self.validation_outputs_path / f"output-{self.trainer.current_epoch}.json"
+        )
+        with open(filename, mode="w") as f:
             json.dump(self.validation_step_outputs, f)
 
         self.validation_step_outputs.clear()
@@ -351,8 +392,8 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         output = self.predict_step(batch, batch_idx)
         self.test_step_outputs.append(output)
         self.rouge.add_batch(
-            predictions=output['predictions'],
-            references=output['references'],
+            predictions=output["predictions"],
+            references=output["references"],
         )
         return output
 
@@ -361,11 +402,15 @@ class RetrieverGeneratorLightning(pl.LightningModule):
         for k, v in rouge_scores.items():
             self.log(k, v, sync_dist=True)
 
-        splited_path = self.args.checkpoint_path.split("/")
-        ckpt_name = splited_path[-1].replace('.ckpt', "")
-        ckpt_type = splited_path[-2]
-        args = f"num_beams={self.args.num_beams}"
-        with open(f"./{ckpt_type}-{ckpt_name}-{args}-outputs.json", mode="w") as f:
+        ckpt_name, ckpt_type = "", "ZeroShot"
+        if isinstance(self.trainer.ckpt_path, (str, Path)):
+            splited_path = self.trainer.ckpt_path.split("/")
+            ckpt_name = splited_path[-1].replace(".ckpt", "")
+            ckpt_type = splited_path[-2]
+        args = f"num_beams={self.generation_config.num_beams}"
+
+        filename = f"./{ckpt_type}-{ckpt_name}-{int(time())}-{args}-outputs.json"
+        with open(filename, mode="w") as f:
             json.dump(self.test_step_outputs, f)
 
         self.test_step_outputs.clear()
@@ -376,7 +421,8 @@ class RetrieverGeneratorLightning(pl.LightningModule):
             optimizer = DeepSpeedCPUAdam(self.parameters(), lr=self.args.lr)
         else:
             optimizer = torch.optim.AdamW(
-                self.trainer.model.parameters(), lr=self.args.lr)
+                self.trainer.model.parameters(), lr=self.args.lr
+            )
             # optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         # optimizer = FusedAdam(self.parameters(), lr=self.args.lr)
         scheduler = get_linear_schedule_with_warmup(

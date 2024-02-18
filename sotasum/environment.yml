@@ -11,25 +11,26 @@ dependencies:
   - torchvision
   - torchaudio
   - pytorch-cuda=11.7
-  - faiss-cpu
+  # - faiss-cpu
   - pip
   - notebook
   - ipywidgets
   - pip:
       - pytorch-lightning[extra]
-      - mlflow
-      - tensorboard
-      - deepspeed
-      - fairscale
-      - transformers
-      - sentencepiece
-      - datasets
-      - evaluate
-      - pandas
-      - gdown
-      - httpx
-      - matplotlib
-      - nltk
-      - rouge-score
-      - rich
-      - pymsteams
+      - -r ../requirements.txt
+      # - mlflow
+      # - tensorboard
+      # - deepspeed
+      # - fairscale
+      # - transformers
+      # - sentencepiece
+      # - datasets
+      # - evaluate
+      # - pandas
+      # - gdown
+      # - httpx
+      # - matplotlib
+      # - nltk
+      # - rouge-score
+      # - rich
+      # - pymsteams
