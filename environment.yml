@@ -1,0 +1,20 @@
+name: ramds
+
+channels:
+  - pytorch
+  - conda-forge
+  - nvidia
+
+dependencies:
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  # - faiss-cpu
+  - pip
+  - notebook
+  - ipywidgets
+  - pip:
+      - pytorch-lightning[extra]
+      - -r ./requirements.txt

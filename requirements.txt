@@ -1,0 +1,19 @@
+# pytorch-lightning[extra]==2.0.5
+mlflow==2.5.0
+faiss-cpu==1.7.3 # => or try install with `conda install faiss-cpu=1.7.3`
+tensorboard==2.13
+deepspeed==0.10.0
+fairscale==0.4.13
+transformers[accelerate]==4.35.2
+adapters==0.1.0
+sentencepiece==0.1.99
+datasets==2.15.0
+evaluate==0.4.0
+pandas==2.0.3
+gdown==4.7.1
+httpx==0.24.1
+matplotlib==3.7.2
+nltk==3.8.1
+rouge-score==0.1.2
+rich==13.4.2
+pymsteams==0.2.2
