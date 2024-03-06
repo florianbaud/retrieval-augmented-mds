@@ -1,0 +1,196 @@
+# pytorch_lightning==2.0.5
+seed_everything: 42
+trainer:
+  accelerator: gpu
+  strategy: auto
+  # strategy:
+  #   class_path: pytorch_lightning.strategies.DeepSpeedStrategy
+  #   init_args:
+  #     stage: 2
+  #     offload_optimizer: true
+  #     # offload_parameters: true
+  #     logging_level: 10 # DEBUG
+  #     # logging_level: 30 # WARN
+  #     initial_scale_power: 4
+  devices: 1
+  num_nodes: 1
+  precision: 16-mixed
+  logger:
+    - class_path: pytorch_lightning.loggers.MLFlowLogger
+      init_args:
+        experiment_name: no_mips
+    # - class_path: pytorch_lightning.loggers.TensorBoardLogger
+    #   init_args:
+    #     save_dir: tb_log
+    #     log_graph: true
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: ./checkpoint/no_mips
+        save_top_k: 1
+        monitor: rouge1
+        mode: max
+        filename: "{epoch}-{rouge1:.2f}"
+    - class_path: pytorch_lightning.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 1
+    # - class_path: sotasum.lightning_model.TeamsCallback
+    #   init_args:
+    #     hookurl: $hookurl
+  fast_dev_run: false
+  max_epochs: 15
+  min_epochs: null
+  max_steps: 20000
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  log_every_n_steps: 1
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 8
+  gradient_clip_val: 0.1
+  gradient_clip_algorithm: norm
+  deterministic: null
+  benchmark: null
+  inference_mode: false
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+ckpt_path: null
+model:
+  class_path: sotasum.lightning_model.LongformerLightning
+  init_args:
+    model_config:
+      log_retriever_metrics: false
+      log_copy_metrics: true
+      validation_batch_size: 16
+      validation_outputs_dir: ./outputs/no_mips
+      rouge_path: rouge
+      lr: 3.0e-05
+      batch_size: 4
+      warmup_steps: 2000
+      total_steps: 20000
+      model_name: allenai/led-large-16384
+      copy_decoder_layers: 1
+      join_method: concat_start_wdoc_global
+      attention_mode: sliding_chunks
+      query_encoder_path: allenai/specter2_base
+      # query_state_dict: ./pretrainedmodels/query-longformer-large-4096/pytorch_model.bin
+      label_smoothing_eps: 0.1
+      use_own_decoder: true
+      gradient_checkpointing: true
+      output_copy_probs: false
+      gates_mode: nmt
+      skip_residual: true
+      memory_forcing: no_forcing
+      use_attention_mask: true
+      memory_model_name: allenai/longformer-base-4096
+      memory_tok_max_length: 512
+      mips_disabled: true
+      mips_freezed: false
+      mips_encoder_freezed: true
+      mips_batch_size: 64
+      mips_num_gpus: 1
+      mips_topk: 10
+      mips_string_factory: Flat
+      # mips_string_factory: IVF2048,Flat
+      # mips_string_factory: IVF16384_HNSW32,Flat
+      # mips_string_factory: IVF32768_HNSW32,Flat
+      # mips_string_factory: IVF4096_HNSW32,Flat
+      mips_nprobe: null
+      mips_rebuild_every: 650
+      mips_train_size: -1
+      mips_metric_type: 1
+      mips_dataset: multi_x_science
+      # mips_arxiv_data_path: ./data/arxiv_parquet/arxiv.parquet
+      mips_arxiv_data_path: null
+      mips_data_script_path: multi_x_science_sum
+      mips_model_name: allenai/specter2_base
+      # mips_state_dict: ./pretrainedmodels/mips-longformer-large-4096/pytorch_model.bin
+      # mips_no_init_build: false
+      mips_db_max_size: 64
+      # mips_db_max_size: null
+      mips_tok_max_length: 512
+      mips_tmp_max_norm_file: max_norm.pkl
+      mips_tmp_index_file: index.faiss
+      mips_tmp_embeddings_folder: embeddings
+      mips_tmp_folder: ./tmp/no_mips
+      mips_cache_prefix: traintest
+      multi_x_science_dataset_mode: original
+      doc_sep: <DOC_SEP>
+      copy_forcing: 0.0
+      source_memory: true
+    generation_config:
+      class_path: transformers.GenerationConfig
+      init_args:
+        max_length: 20
+        max_new_tokens: 256
+        min_length: 16
+        min_new_tokens: null
+        early_stopping: false
+        max_time: null
+        do_sample: false
+        num_beams: 4
+        num_beam_groups: 1
+        penalty_alpha: null
+        use_cache: true
+        temperature: 1.0
+        top_k: 50
+        top_p: 1.0
+        typical_p: 1.0
+        epsilon_cutoff: 0.0
+        eta_cutoff: 0.0
+        diversity_penalty: 0.0
+        repetition_penalty: 1.0
+        encoder_repetition_penalty: 1.0
+        length_penalty: 1.0
+        no_repeat_ngram_size: 3
+        bad_words_ids: null
+        force_words_ids: null
+        renormalize_logits: false
+        constraints: null
+        forced_bos_token_id: null
+        forced_eos_token_id: null
+        remove_invalid_values: false
+        exponential_decay_length_penalty: null
+        suppress_tokens: null
+        begin_suppress_tokens: null
+        forced_decoder_ids: null
+        sequence_bias: null
+        guidance_scale: null
+        num_return_sequences: 1
+        output_attentions: false
+        output_hidden_states: false
+        output_scores: false
+        return_dict_in_generate: false
+        pad_token_id: null
+        bos_token_id: null
+        eos_token_id: null
+        encoder_no_repeat_ngram_size: 0
+        decoder_start_token_id: null
+        generation_kwargs: {}
+        transformers_version: null
+data:
+  class_path: sotasum.data_modules.RGMultiXScienceDataModule
+  init_args:
+    path: multi_x_science_sum
+    save_path: ./data_hf/multixscienceRG.arrow
+    aggregation: false
+    num_workers: 5
+    max_length: 2048
+    query_max_length: 512
+    decoder_max_length: 512
+    num_proc_tokenization: 4

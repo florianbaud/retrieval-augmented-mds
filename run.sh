@@ -6,4 +6,4 @@ export CUDA_LAUNCH_BLOCKING=1
 export TOKENIZERS_PARALLELISM=false
 
 # Train
-python -u main.py fit --config config.yaml
+python -u main.py fit --config ./config/no_mips.yaml
